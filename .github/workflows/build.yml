@@ -1,0 +1,54 @@
+name: Build & Push
+
+# Builds the agent image and pushes it to GHCR on merge to main (or manually).
+# The Docker build itself is delegated to the shared reusable workflow in
+# vritti-ai-platforms/infrastructure; a native Go check gates it first.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# The reusable build job pushes to GHCR, so the caller must grant packages: write.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  check:
+    name: Go build & vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  image:
+    name: Build image
+    needs: check
+    # The reusable is Node-oriented; skip its pnpm lint/test and let it run the generic
+    # Docker build + GHCR push. Version comes from version.json (read via jq .version).
+    uses: vritti-ai-platforms/infrastructure/.github/workflows/reusable-build-backend-image.yml@main
+    with:
+      service_name: application-agent
+      dockerfile_path: ./Dockerfile
+      build_context: .
+      package_json_path: ./version.json
+      skip_lint_test: true
+    secrets: inherit

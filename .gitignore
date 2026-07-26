@@ -1,0 +1,13 @@
+# Binaries
+/vritti-agent
+/dist/
+/out/
+
+# Local agent state (never commit keys/secrets)
+/var/
+*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

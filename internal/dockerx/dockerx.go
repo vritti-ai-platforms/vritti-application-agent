@@ -1,0 +1,509 @@
+// Package dockerx is a thin, opinionated wrapper over the Docker Engine SDK.
+// The agent drives the Engine API directly — there is no docker-compose file.
+// Every object the agent creates is tagged with the deployment label so the
+// reconciler can list and prune exactly what it owns.
+package dockerx
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"maps"
+	"strings"
+	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/go-connections/nat"
+)
+
+// LabelDeployment tags every container/network the agent owns with the deployment id.
+const LabelDeployment = "vritti.deployment"
+
+// LabelSpecHash stores the hash of the RunSpec a container was created from so the
+// reconciler can detect drift and recreate only when the desired spec actually changed.
+const LabelSpecHash = "vritti.spec-hash"
+
+// LabelService names the logical service (postgres, core-server, ...) within a deployment.
+const LabelService = "vritti.service"
+
+// Client wraps the Docker SDK client plus the deployment id it operates on.
+type Client struct {
+	api          *client.Client
+	deploymentID string
+}
+
+// New negotiates an API version against the local Docker daemon.
+func New(deploymentID string) (*Client, error) {
+	api, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, fmt.Errorf("docker client: %w", err)
+	}
+	return &Client{api: api, deploymentID: deploymentID}, nil
+}
+
+// Close releases the underlying HTTP transport.
+func (c *Client) Close() error { return c.api.Close() }
+
+// HealthSpec is a container-level healthcheck.
+type HealthSpec struct {
+	Test     []string
+	Interval time.Duration
+	Timeout  time.Duration
+	Retries  int
+	Start    time.Duration
+}
+
+// RunSpec is the declarative description of a single container the agent wants running.
+type RunSpec struct {
+	Name         string
+	Image        string
+	Env          []string
+	Cmd          []string
+	Binds        []string          // "hostPath:containerPath[:ro]"
+	Ports        map[string]string // containerPort/proto -> hostPort ("" = published on all)
+	ExposedPorts []string          // "port/proto" exposed but not published
+	Network      string
+	Service      string
+	Labels       map[string]string
+	Restart      bool
+	MemLimit     int64
+	ExtraHosts   []string
+	Health       *HealthSpec
+}
+
+// EnsureNetwork creates the bridge network if it does not already exist.
+func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
+	nets, err := c.api.NetworkList(ctx, network.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("name", name)),
+	})
+	if err != nil {
+		return err
+	}
+	for _, n := range nets {
+		if n.Name == name {
+			return nil
+		}
+	}
+	_, err = c.api.NetworkCreate(ctx, name, network.CreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{LabelDeployment: c.deploymentID},
+	})
+	return err
+}
+
+// EnsureVolume creates a named volume if absent (used only where a bind mount is not suitable).
+func (c *Client) EnsureVolume(ctx context.Context, name string) error {
+	_, err := c.api.VolumeCreate(ctx, volume.CreateOptions{
+		Name:   name,
+		Labels: map[string]string{LabelDeployment: c.deploymentID},
+	})
+	return err
+}
+
+// PullImage pulls a reference and drains the progress stream to completion.
+func (c *Client) PullImage(ctx context.Context, ref string) error {
+	rc, err := c.api.ImagePull(ctx, ref, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("pull %s: %w", ref, err)
+	}
+	defer rc.Close()
+	_, err = io.Copy(io.Discard, rc)
+	return err
+}
+
+// containerByName returns the container id for a name, and whether it exists.
+func (c *Client) containerByName(ctx context.Context, name string) (string, bool, error) {
+	list, err := c.api.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", "^/"+name+"$")),
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if len(list) == 0 {
+		return "", false, nil
+	}
+	return list[0].ID, true, nil
+}
+
+// SpecHash reads the recorded spec hash label of a running container ("" if absent/missing).
+func (c *Client) SpecHash(ctx context.Context, name string) (string, error) {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil || !ok {
+		return "", err
+	}
+	insp, err := c.api.ContainerInspect(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return insp.Config.Labels[LabelSpecHash], nil
+}
+
+// Remove force-removes a container by name (no-op if it does not exist).
+func (c *Client) Remove(ctx context.Context, name string) error {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil || !ok {
+		return err
+	}
+	return c.api.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
+}
+
+// Restart restarts a container by name.
+func (c *Client) Restart(ctx context.Context, name string) error {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("container %s not found", name)
+	}
+	return c.api.ContainerRestart(ctx, id, container.StopOptions{})
+}
+
+// create builds the container from a RunSpec and returns its id (does not start it).
+func (c *Client) create(ctx context.Context, spec RunSpec) (string, error) {
+	labels := map[string]string{
+		LabelDeployment: c.deploymentID,
+		LabelService:    spec.Service,
+	}
+	maps.Copy(labels, spec.Labels)
+
+	exposed := nat.PortSet{}
+	bindings := nat.PortMap{}
+	for _, p := range spec.ExposedPorts {
+		exposed[nat.Port(p)] = struct{}{}
+	}
+	for cport, hport := range spec.Ports {
+		np := nat.Port(cport)
+		exposed[np] = struct{}{}
+		bindings[np] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: hport}}
+	}
+
+	cfg := &container.Config{
+		Image:        spec.Image,
+		Env:          spec.Env,
+		Cmd:          spec.Cmd,
+		Labels:       labels,
+		ExposedPorts: exposed,
+	}
+	if spec.Health != nil {
+		cfg.Healthcheck = &container.HealthConfig{
+			Test:        spec.Health.Test,
+			Interval:    spec.Health.Interval,
+			Timeout:     spec.Health.Timeout,
+			Retries:     spec.Health.Retries,
+			StartPeriod: spec.Health.Start,
+		}
+	}
+
+	host := &container.HostConfig{
+		Binds:        spec.Binds,
+		PortBindings: bindings,
+		ExtraHosts:   spec.ExtraHosts,
+		Resources:    container.Resources{Memory: spec.MemLimit},
+		LogConfig: container.LogConfig{
+			Type:   "json-file",
+			Config: map[string]string{"max-size": "10m", "max-file": "3"},
+		},
+	}
+	if spec.Restart {
+		host.RestartPolicy = container.RestartPolicy{Name: container.RestartPolicyUnlessStopped}
+	}
+
+	netCfg := &network.NetworkingConfig{}
+	if spec.Network != "" {
+		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{spec.Network: {}}
+	}
+
+	created, err := c.api.ContainerCreate(ctx, cfg, host, netCfg, nil, spec.Name)
+	if err != nil {
+		return "", fmt.Errorf("create %s: %w", spec.Name, err)
+	}
+	return created.ID, nil
+}
+
+// Run removes any existing container of the same name and creates+starts a fresh one.
+func (c *Client) Run(ctx context.Context, spec RunSpec) error {
+	if err := c.Remove(ctx, spec.Name); err != nil {
+		return err
+	}
+	id, err := c.create(ctx, spec)
+	if err != nil {
+		return err
+	}
+	return c.api.ContainerStart(ctx, id, container.StartOptions{})
+}
+
+// RunToCompletion runs a one-shot container (migrations, backups), waits for exit,
+// and returns the exit code together with the captured logs.
+func (c *Client) RunToCompletion(ctx context.Context, spec RunSpec) (int, string, error) {
+	if err := c.Remove(ctx, spec.Name); err != nil {
+		return -1, "", err
+	}
+	id, err := c.create(ctx, spec)
+	if err != nil {
+		return -1, "", err
+	}
+	defer c.api.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
+
+	if err := c.api.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+		return -1, "", err
+	}
+	waitCh, errCh := c.api.ContainerWait(ctx, id, container.WaitConditionNotRunning)
+	var code int
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return -1, "", err
+		}
+	case st := <-waitCh:
+		code = int(st.StatusCode)
+	}
+	logs := c.readLogs(ctx, id, "all")
+	return code, logs, nil
+}
+
+// Logs returns the last `tail` lines of a container's combined stdout/stderr.
+func (c *Client) Logs(ctx context.Context, name, tail string) (string, error) {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("container %s not found", name)
+	}
+	return c.readLogs(ctx, id, tail), nil
+}
+
+// readLogs demultiplexes the Docker log stream into a plain string.
+func (c *Client) readLogs(ctx context.Context, id, tail string) string {
+	rc, err := c.api.ContainerLogs(ctx, id, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       tail,
+	})
+	if err != nil {
+		return ""
+	}
+	defer rc.Close()
+	var out bytes.Buffer
+	_, _ = stdcopy.StdCopy(&out, &out, rc)
+	return out.String()
+}
+
+// StatsSample is a point-in-time resource reading for one container.
+type StatsSample struct {
+	Service     string  `json:"service"`
+	Name        string  `json:"name"`
+	CPUPercent  float64 `json:"cpuPercent"`
+	MemoryBytes uint64  `json:"memoryBytes"`
+	MemoryLimit uint64  `json:"memoryLimit"`
+	MemPercent  float64 `json:"memPercent"`
+}
+
+// rawStats is a minimal projection of the Engine stats JSON (version-stable subset).
+type rawStats struct {
+	CPUStats struct {
+		CPUUsage struct {
+			TotalUsage uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+		SystemUsage uint64 `json:"system_cpu_usage"`
+		OnlineCPUs  uint64 `json:"online_cpus"`
+	} `json:"cpu_stats"`
+	PreCPUStats struct {
+		CPUUsage struct {
+			TotalUsage uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+		SystemUsage uint64 `json:"system_cpu_usage"`
+	} `json:"precpu_stats"`
+	MemoryStats struct {
+		Usage uint64            `json:"usage"`
+		Limit uint64            `json:"limit"`
+		Stats map[string]uint64 `json:"stats"`
+	} `json:"memory_stats"`
+}
+
+// Stats reads a single (non-streaming) resource sample for a container by name.
+func (c *Client) Stats(ctx context.Context, name string) (StatsSample, error) {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil {
+		return StatsSample{}, err
+	}
+	if !ok {
+		return StatsSample{}, fmt.Errorf("container %s not found", name)
+	}
+	resp, err := c.api.ContainerStats(ctx, id, false)
+	if err != nil {
+		return StatsSample{}, err
+	}
+	defer resp.Body.Close()
+
+	var raw rawStats
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return StatsSample{}, err
+	}
+
+	// Working-set memory = usage minus reclaimable page cache (matches `docker stats`).
+	mem := raw.MemoryStats.Usage
+	if cache, ok := raw.MemoryStats.Stats["inactive_file"]; ok && cache < mem {
+		mem -= cache
+	}
+	sample := StatsSample{
+		Name:        strings.TrimPrefix(name, "/"),
+		MemoryBytes: mem,
+		MemoryLimit: raw.MemoryStats.Limit,
+	}
+	if raw.MemoryStats.Limit > 0 {
+		sample.MemPercent = float64(mem) / float64(raw.MemoryStats.Limit) * 100
+	}
+	cpuDelta := float64(raw.CPUStats.CPUUsage.TotalUsage - raw.PreCPUStats.CPUUsage.TotalUsage)
+	sysDelta := float64(raw.CPUStats.SystemUsage - raw.PreCPUStats.SystemUsage)
+	if sysDelta > 0 && cpuDelta > 0 {
+		cpus := float64(raw.CPUStats.OnlineCPUs)
+		if cpus == 0 {
+			cpus = 1
+		}
+		sample.CPUPercent = (cpuDelta / sysDelta) * cpus * 100
+	}
+	return sample, nil
+}
+
+// ContainerStatus is the reconciler-visible state of one owned container.
+type ContainerStatus struct {
+	Service string `json:"service"`
+	Name    string `json:"name"`
+	State   string `json:"state"`
+	Status  string `json:"status"`
+	Health  string `json:"health"`
+	Image   string `json:"image"`
+}
+
+// List returns every container the agent owns for this deployment.
+func (c *Client) List(ctx context.Context) ([]ContainerStatus, error) {
+	list, err := c.api.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", LabelDeployment+"="+c.deploymentID)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ContainerStatus, 0, len(list))
+	for _, ct := range list {
+		name := ""
+		if len(ct.Names) > 0 {
+			name = strings.TrimPrefix(ct.Names[0], "/")
+		}
+		cs := ContainerStatus{
+			Service: ct.Labels[LabelService],
+			Name:    name,
+			State:   ct.State,
+			Status:  ct.Status,
+			Image:   ct.Image,
+		}
+		if insp, err := c.api.ContainerInspect(ctx, ct.ID); err == nil && insp.State != nil && insp.State.Health != nil {
+			cs.Health = insp.State.Health.Status
+		}
+		out = append(out, cs)
+	}
+	return out, nil
+}
+
+// ownedNames returns the set of container names the agent currently owns.
+func (c *Client) ownedNames(ctx context.Context) (map[string]bool, error) {
+	list, err := c.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]bool, len(list))
+	for _, ct := range list {
+		names[ct.Name] = true
+	}
+	return names, nil
+}
+
+// PruneExcept removes owned containers whose names are not in `keep`.
+func (c *Client) PruneExcept(ctx context.Context, keep map[string]bool) error {
+	owned, err := c.ownedNames(ctx)
+	if err != nil {
+		return err
+	}
+	for name := range owned {
+		if !keep[name] {
+			if err := c.Remove(ctx, name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Exec runs a command inside a running container and returns its exit code + combined output.
+func (c *Client) Exec(ctx context.Context, name string, cmd []string) (int, string, error) {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil {
+		return -1, "", err
+	}
+	if !ok {
+		return -1, "", fmt.Errorf("container %s not found", name)
+	}
+	created, err := c.api.ContainerExecCreate(ctx, id, container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return -1, "", err
+	}
+	attach, err := c.api.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return -1, "", err
+	}
+	defer attach.Close()
+
+	var out bytes.Buffer
+	_, _ = stdcopy.StdCopy(&out, &out, attach.Reader)
+
+	insp, err := c.api.ContainerExecInspect(ctx, created.ID)
+	if err != nil {
+		return -1, out.String(), err
+	}
+	return insp.ExitCode, out.String(), nil
+}
+
+// WaitHealthy blocks until the named container reports healthy (or the timeout elapses).
+func (c *Client) WaitHealthy(ctx context.Context, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		id, ok, err := c.containerByName(ctx, name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			insp, err := c.api.ContainerInspect(ctx, id)
+			if err == nil && insp.State != nil {
+				if insp.State.Health == nil && insp.State.Running {
+					return nil // no healthcheck defined; running is enough
+				}
+				if insp.State.Health != nil && insp.State.Health.Status == "healthy" {
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("container %s not healthy within %s", name, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
