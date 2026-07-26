@@ -17,14 +17,13 @@ const Network = "vritti-core-net"
 
 // Fixed service names (also the container names — one deployment per host).
 const (
-	SvcPostgres   = "postgres"
-	SvcRedis      = "redis"
-	SvcNats       = "nats"
-	SvcCore       = "core-server"
-	SvcCommerce   = "commerce-service"
-	SvcGitea      = "gitea"
-	SvcPgBackRest = "pgbackrest"
-	SvcNginx      = "nginx"
+	SvcPostgres = "postgres"
+	SvcRedis    = "redis"
+	SvcNats     = "nats"
+	SvcCore     = "core-server"
+	SvcCommerce = "commerce-service"
+	SvcGitea    = "gitea"
+	SvcNginx    = "nginx"
 )
 
 // DBConn is the resolved database connection for the current mode.

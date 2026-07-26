@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/agentcrypto"
@@ -40,6 +41,8 @@ type Agent struct {
 	enrollment *cloudapi.Enrollment
 
 	lastGeneration int64
+	archiving      bool // pgBackRest add-on currently enabled (drives the backup ticker)
+	hadFullBackup  bool // a full backup has been taken since archiving was enabled
 }
 
 // New bootstraps the agent: loads config, local keys, machine secrets, and the Docker client.
@@ -78,6 +81,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	ticker := time.NewTicker(a.cfg.PollInterval)
 	defer ticker.Stop()
 
+	// Backup schedule (only fires when the pgBackRest add-on is enabled): hourly incremental,
+	// with a full every 24th tick (daily). The initial full is taken at enable time in reconcile.
+	backupTicker := time.NewTicker(time.Hour)
+	defer backupTicker.Stop()
+	backupTick := 0
+
 	a.tick(ctx) // reconcile immediately on boot
 	for {
 		select {
@@ -85,6 +94,19 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			a.tick(ctx)
+		case <-backupTicker.C:
+			if a.archiving {
+				backupTick++
+				bt := "incr"
+				if backupTick%24 == 0 {
+					bt = "full"
+				}
+				if err := deploy.RunBackup(ctx, a.dx, bt); err != nil {
+					a.log.Warn("scheduled backup failed", "type", bt, "err", err)
+				} else {
+					a.log.Info("scheduled backup complete", "type", bt)
+				}
+			}
 		}
 	}
 }
@@ -151,9 +173,19 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 
 	keep := map[string]bool{}
 
-	// (5) Managed mode: bring up Postgres, wait healthy, provision roles/schemas.
+	// (5) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
+	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
+	archiving := ds.Mode == cloudapi.ModeManaged && ds.AddOns.PgBackRest
 	if ds.Mode == cloudapi.ModeManaged {
-		pg := deploy.PostgresSpec(ds, a.machine, a.cfg.StackRoot)
+		if archiving {
+			// Config must exist before Postgres boots so archive_command works from the first WAL.
+			conf := deploy.RenderPgBackRestConf(ds, a.machine, resolved)
+			confPath := filepath.Join(a.cfg.StackRoot, "pgbackrest", "pgbackrest.conf")
+			if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+				return false, err
+			}
+		}
+		pg := deploy.PostgresSpec(ds, a.machine, a.cfg.StackRoot, archiving)
 		if err := deploy.Apply(ctx, a.dx, pg); err != nil {
 			return false, fmt.Errorf("postgres: %w", err)
 		}
@@ -164,7 +196,19 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 		if err := deploy.EnsureManagedDatabase(ctx, a.dx, a.machine); err != nil {
 			return false, err
 		}
+		if archiving {
+			if err := deploy.EnsureStanza(ctx, a.dx); err != nil {
+				return false, err
+			}
+			if !a.hadFullBackup {
+				if err := deploy.RunBackup(ctx, a.dx, "full"); err != nil {
+					return false, err
+				}
+				a.hadFullBackup = true
+			}
+		}
 	}
+	a.archiving = archiving
 
 	// (6) Run migrations (owner conn) to completion before the app services roll.
 	coreEnvBase := deploy.CoreEnvInput{
@@ -211,10 +255,8 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	coreEnv := deploy.RenderCoreEnv(coreEnvBase)
 	longRunning = append(longRunning, deploy.CoreServerSpec(ds, coreEnv, a.cfg.StackRoot))
 
-	// (9) pgBackRest (premium) + nginx (edge) add-ons.
-	if ds.AddOns.PgBackRest && ds.Mode == cloudapi.ModeManaged {
-		longRunning = append(longRunning, deploy.PgBackRestSpec(ds, a.cfg.StackRoot))
-	}
+	// (9) nginx (edge) add-on. pgBackRest is NOT a container — archiving lives in the Postgres
+	// spec (step 5) and scheduled backups run via `docker exec` on the backup ticker.
 	if ds.AddOns.Nginx {
 		longRunning = append(longRunning, deploy.NginxSpec(ds, a.cfg.StackRoot))
 	}

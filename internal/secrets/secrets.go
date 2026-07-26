@@ -25,6 +25,7 @@ type Machine struct {
 	RedisPassword         string `json:"redisPassword"`
 	GiteaAdminUser        string `json:"giteaAdminUser"`
 	GiteaAdminPassword    string `json:"giteaAdminPassword"`
+	PgBackRestCipherPass  string `json:"pgBackRestCipherPass"`
 }
 
 // LoadOrCreate returns the persisted machine secrets, generating them on first run.
@@ -52,6 +53,7 @@ func LoadOrCreate(dir string) (*Machine, error) {
 		RedisPassword:         randHex(24),
 		GiteaAdminUser:        "vritti-admin",
 		GiteaAdminPassword:    randHex(24),
+		PgBackRestCipherPass:  randHex(32),
 	}
 	blob, _ := json.MarshalIndent(m, "", "  ")
 	if err := os.WriteFile(path, blob, 0o600); err != nil {

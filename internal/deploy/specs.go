@@ -25,7 +25,28 @@ func httpHealth(port int) *dockerx.HealthSpec {
 }
 
 // PostgresSpec is the containerized Postgres (managed mode only). Pinned major, bind-mounted data.
-func PostgresSpec(ds cloudapi.DesiredState, m *secrets.Machine, stackRoot string) dockerx.RunSpec {
+//
+// The image ALWAYS carries the pgBackRest binary; it's dormant unless `archiving` is set. When
+// the premium backup add-on is on we flip archive_mode=on + archive_command via the postgres
+// command args and mount the pgbackrest config + local repo. Because archive_mode isn't
+// reloadable, toggling this changes the spec hash and the reconciler recreates the container
+// (a brief, deliberate restart) — which is exactly the required behavior.
+func PostgresSpec(ds cloudapi.DesiredState, m *secrets.Machine, stackRoot string, archiving bool) dockerx.RunSpec {
+	binds := []string{filepath.Join(stackRoot, "pgdata") + ":/var/lib/postgresql/data"}
+	var cmd []string
+	if archiving {
+		binds = append(binds,
+			filepath.Join(stackRoot, "pgbackrest")+":/etc/pgbackrest:ro",
+			filepath.Join(stackRoot, "backup")+":/var/lib/pgbackrest",
+		)
+		cmd = []string{
+			"postgres",
+			"-c", "archive_mode=on",
+			"-c", "archive_command=pgbackrest --stanza=" + StanzaName + " archive-push %p",
+			"-c", "archive_timeout=60",
+			"-c", "max_wal_size=1GB",
+		}
+	}
 	return dockerx.RunSpec{
 		Name:    SvcPostgres,
 		Service: SvcPostgres,
@@ -36,7 +57,8 @@ func PostgresSpec(ds cloudapi.DesiredState, m *secrets.Machine, stackRoot string
 			"POSTGRES_DB=vritti_core",
 			"PGDATA=/var/lib/postgresql/data/pgdata",
 		},
-		Binds:        []string{filepath.Join(stackRoot, "pgdata") + ":/var/lib/postgresql/data"},
+		Cmd:          cmd,
+		Binds:        binds,
 		ExposedPorts: []string{"5432/tcp"},
 		Network:      Network,
 		Restart:      true,
@@ -165,29 +187,11 @@ func GiteaSpec(ds cloudapi.DesiredState, m *secrets.Machine, db DBConn, stackRoo
 	}
 }
 
-// PgBackRestSpec runs the backup sidecar (premium; managed mode only). It shares the pgdata
-// bind for local repo1 and holds the config that also defines the R2 repo2.
-func PgBackRestSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
-	return dockerx.RunSpec{
-		Name:    SvcPgBackRest,
-		Service: SvcPgBackRest,
-		Image:   ds.Images.Postgres, // same postgres+pgBackRest image, run as the backup scheduler
-		Cmd: []string{
-			"sh", "-c",
-			// Scheduler placeholder: a real deploy installs a cron loop calling `pgbackrest backup`.
-			// Kept as a long-lived container so the reconciler manages its lifecycle uniformly.
-			"while true; do sleep 3600; done",
-		},
-		Binds: []string{
-			filepath.Join(stackRoot, "pgdata") + ":/var/lib/postgresql/data:ro",
-			filepath.Join(stackRoot, "backup") + ":/var/lib/pgbackrest",
-			filepath.Join(stackRoot, "pgbackrest") + ":/etc/pgbackrest",
-		},
-		Network:  Network,
-		Restart:  true,
-		MemLimit: 128 * mib,
-	}
-}
+// Backups are NOT a standalone sidecar: a separate container can't run archive_command (that's
+// in the Postgres process) and a local-mode `pgbackrest backup` needs the Postgres container's
+// data dir + local socket. So both archiving and scheduled backups run INSIDE the Postgres
+// container — archive_command continuously, and `pgbackrest backup` via `docker exec` on the
+// agent's schedule (see pgbackrest.go). There is no pgbackrest container to manage.
 
 // NginxSpec is the edge proxy for customer/prod VMs (dev on vm1 uses a shared edge instead).
 func NginxSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
