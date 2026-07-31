@@ -26,9 +26,7 @@ type Client struct {
 	http         *http.Client
 	signer       Signer
 
-	credential     string // set after enroll
-	cfAccessID     string // Cloudflare Access service-token id (admin surface is Access-gated)
-	cfAccessSecret string // Cloudflare Access service-token secret
+	credential string // set after enroll
 }
 
 // New builds a cloud client for one deployment.
@@ -43,13 +41,6 @@ func New(baseURL, deploymentID string, signer Signer) *Client {
 
 // SetCredential installs the bearer credential returned from enrollment.
 func (c *Client) SetCredential(cred string) { c.credential = cred }
-
-// SetAccessServiceToken installs the Cloudflare Access service-token headers sent on every
-// request (cloud's agent API lives behind the Access-gated admin surface). No-op when empty.
-func (c *Client) SetAccessServiceToken(id, secret string) {
-	c.cfAccessID = id
-	c.cfAccessSecret = secret
-}
 
 // Enroll performs the one-time enrollment handshake and returns the deployment public key
 // plus the connectivity nonce/signature for the caller to verify.
@@ -117,10 +108,6 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Vritti-Deployment", c.deploymentID)
-	if c.cfAccessID != "" {
-		req.Header.Set("CF-Access-Client-Id", c.cfAccessID)
-		req.Header.Set("CF-Access-Client-Secret", c.cfAccessSecret)
-	}
 	if c.credential != "" {
 		req.Header.Set("Authorization", "Bearer "+c.credential)
 	}

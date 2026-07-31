@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/cloudapi"
-	"github.com/vritti-ai-platforms/vritti-application-agent/internal/config"
 )
 
 // Network is the private bridge every service in a core deployment shares.
@@ -46,18 +45,37 @@ func (d DBConn) DirectURL() string {
 		d.OwnerUser, d.OwnerPassword, d.Host, d.Port, d.Database, d.SSLMode)
 }
 
-// ManagedDBConn builds the connection for the containerized Postgres (creds supplied via config).
-func ManagedDBConn(cfg *config.Config) DBConn {
+// ManagedProvisioning are the raw data-store creds the agent uses to stand up managed Postgres +
+// Redis. They come from Infisical's `/agent` folder (never generated, never seen by cloud) and are
+// threaded through the reconcile rather than read from cfg.
+type ManagedProvisioning struct {
+	DBName        string // per-deployment DB name (defaults to vritti_core when empty)
+	OwnerPassword string // vritti_core_owner — the container superuser + migration role
+	AppPassword   string // vritti_core_app — least-privilege runtime login
+	GiteaPassword string // gitea — least-privilege login owning only the gitea schema
+	RedisPassword string
+}
+
+// database returns the configured DB name, defaulting to vritti_core.
+func (p ManagedProvisioning) database() string {
+	if p.DBName == "" {
+		return "vritti_core"
+	}
+	return p.DBName
+}
+
+// ManagedDBConn builds the connection for the containerized Postgres from the provisioning creds.
+func ManagedDBConn(p ManagedProvisioning) DBConn {
 	return DBConn{
 		Host:          SvcPostgres,
 		Port:          "5432",
-		Database:      "vritti_core",
+		Database:      p.database(),
 		AppUser:       "vritti_core_app",
-		AppPassword:   cfg.DBAppPassword,
+		AppPassword:   p.AppPassword,
 		OwnerUser:     "vritti_core_owner",
-		OwnerPassword: cfg.DBOwnerPassword,
+		OwnerPassword: p.OwnerPassword,
 		GiteaUser:     "gitea",
-		GiteaPassword: cfg.DBGiteaPassword,
+		GiteaPassword: p.GiteaPassword,
 		SSLMode:       "disable",
 	}
 }
@@ -105,13 +123,13 @@ func ExternalDBConn(decrypted []byte) (DBConn, error) {
 	}, nil
 }
 
-// ResolveDBConn returns the DBConn for the deployment's mode. For external mode the caller
-// supplies the already-decrypted sealed secret bytes.
-func ResolveDBConn(ds cloudapi.DesiredState, cfg *config.Config, externalSecret []byte) (DBConn, error) {
+// ResolveDBConn returns the DBConn for the deployment's mode. Managed mode uses the provisioning
+// creds from Infisical's `/agent` folder; external mode parses the already-decrypted sealed secret.
+func ResolveDBConn(ds cloudapi.DesiredState, prov ManagedProvisioning, externalSecret []byte) (DBConn, error) {
 	if ds.Mode == cloudapi.ModeExternal {
 		return ExternalDBConn(externalSecret)
 	}
-	return ManagedDBConn(cfg), nil
+	return ManagedDBConn(prov), nil
 }
 
 // Dirs returns the host bind-mount directories that must exist before containers start.

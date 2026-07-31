@@ -68,7 +68,7 @@ internal/
 ## Run
 
 ```bash
-export VRITTI_CLOUD_URL=https://cloud.vrittiai.com
+export VRITTI_CLOUD_API_URL=https://api.vrittiai.com
 export VRITTI_DEPLOYMENT_ID=<uuid>
 export VRITTI_ENROLL_TOKEN=<one-time token from admin>   # only needed on first boot
 go run ./cmd/agent

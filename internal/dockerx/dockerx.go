@@ -7,10 +7,13 @@ package dockerx
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -108,15 +112,91 @@ func (c *Client) EnsureVolume(ctx context.Context, name string) error {
 	return err
 }
 
-// PullImage pulls a reference and drains the progress stream to completion.
+// PullImage pulls a reference and drains the progress stream to completion. It attaches registry
+// credentials resolved from the host Docker config (as written by `docker login`) when present, so
+// private images pull without any store-specific auth baked into the agent; public images pull
+// anonymously when no matching credential is found.
 func (c *Client) PullImage(ctx context.Context, ref string) error {
-	rc, err := c.api.ImagePull(ctx, ref, image.PullOptions{})
+	rc, err := c.api.ImagePull(ctx, ref, image.PullOptions{RegistryAuth: resolveRegistryAuth(ref)})
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
 	defer rc.Close()
 	_, err = io.Copy(io.Discard, rc)
 	return err
+}
+
+// resolveRegistryAuth returns the base64 X-Registry-Auth header for ref's registry, read from the
+// host Docker config (DOCKER_CONFIG or ~/.docker/config.json), or "" for an anonymous pull. This is
+// generic: the agent reuses whatever registry the host is logged in to, with nothing registry- or
+// operator-specific compiled in.
+func resolveRegistryAuth(ref string) string {
+	host := registryHost(ref)
+
+	cfgDir := os.Getenv("DOCKER_CONFIG")
+	if cfgDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		cfgDir = filepath.Join(home, ".docker")
+	}
+	raw, err := os.ReadFile(filepath.Join(cfgDir, "config.json"))
+	if err != nil {
+		return ""
+	}
+
+	var cfg struct {
+		Auths map[string]struct {
+			Auth     string `json:"auth"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+		} `json:"auths"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return ""
+	}
+
+	entry, ok := cfg.Auths[host]
+	if !ok {
+		return ""
+	}
+	user, pass := entry.Username, entry.Password
+	if entry.Auth != "" {
+		if dec, err := base64.StdEncoding.DecodeString(entry.Auth); err == nil {
+			if i := strings.IndexByte(string(dec), ':'); i >= 0 {
+				user, pass = string(dec[:i]), string(dec[i+1:])
+			}
+		}
+	}
+	if user == "" && pass == "" {
+		return ""
+	}
+
+	enc, err := registry.EncodeAuthConfig(registry.AuthConfig{
+		Username:      user,
+		Password:      pass,
+		ServerAddress: host,
+	})
+	if err != nil {
+		return ""
+	}
+	return enc
+}
+
+// registryHost extracts the registry hostname from an image reference, defaulting to Docker Hub.
+// The registry is the first path segment only when it looks like a host (contains "." or ":", or is
+// "localhost"); otherwise the reference is a Docker Hub library/user image.
+func registryHost(ref string) string {
+	i := strings.IndexByte(ref, '/')
+	if i < 0 {
+		return "docker.io"
+	}
+	first := ref[:i]
+	if first == "localhost" || strings.ContainsAny(first, ".:") {
+		return first
+	}
+	return "docker.io"
 }
 
 // containerByName returns the container id for a name, and whether it exists.

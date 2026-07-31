@@ -1,14 +1,12 @@
 // Package secrets generates and persists the deployment's MACHINE secrets on the VM.
 //
-// These values are created here, by the agent, and never travel to cloud: the app crypto
-// secrets (JWT/HMAC/COOKIE) and the pgBackRest cipher pass. Cloud stores config + sealed human
-// secrets only — never these. Data-store passwords (Postgres + Redis) and the Gitea admin
-// password are NOT here: they are supplied via config (env file / Infisical agent folder).
+// In Model B the app crypto secrets (JWT/HMAC/COOKIE/ENCRYPTION) come from Infisical's
+// `/core-server` env — the agent no longer generates them. The only value still minted here is
+// the pgBackRest cipher passphrase, which encrypts backups locally and must never leave the VM.
 package secrets
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -17,9 +15,6 @@ import (
 
 // Machine is the set of locally generated secrets, persisted once and reused across reconciles.
 type Machine struct {
-	JWTSecret            string `json:"jwtSecret"`
-	HMACKey              string `json:"hmacKey"`
-	CookieSecret         string `json:"cookieSecret"`
 	PgBackRestCipherPass string `json:"pgBackRestCipherPass"`
 }
 
@@ -39,9 +34,6 @@ func LoadOrCreate(dir string) (*Machine, error) {
 	}
 
 	m := &Machine{
-		JWTSecret:            randB64(32),
-		HMACKey:              randB64(32),
-		CookieSecret:         randB64(32),
 		PgBackRestCipherPass: randHex(32),
 	}
 	blob, _ := json.MarshalIndent(m, "", "  ")
@@ -55,10 +47,4 @@ func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func randB64(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
 }

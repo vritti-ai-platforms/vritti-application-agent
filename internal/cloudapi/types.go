@@ -13,6 +13,31 @@ const (
 	ModeExternal DBMode = "external"
 )
 
+// EdgeMode selects how the deployment's HTTP edge (nginx + TLS) is provided. nginx is a core
+// service, on by default (managed); external is the deliberate opt-out for deployments fronted by
+// something else (the shared vm1 edge, a customer LB/ingress, or a tunnel).
+type EdgeMode string
+
+const (
+	// EdgeManaged  — the agent runs nginx and obtains Let's Encrypt certs (certbot) for the domains.
+	EdgeManaged EdgeMode = "managed"
+	// EdgeExternal — something else fronts core; the agent runs no nginx and no certbot.
+	EdgeExternal EdgeMode = "external"
+)
+
+// DomainRoute is one host the managed edge serves (and obtains a cert for) plus its upstream.
+type DomainRoute struct {
+	Host     string `json:"host"`     // e.g. api.apw1.vrittiai.com
+	Upstream string `json:"upstream"` // e.g. core-server:3002
+}
+
+// CertReport is the state of one obtained certificate, reported back to cloud (the system of record).
+type CertReport struct {
+	Host     string `json:"host"`
+	NotAfter string `json:"notAfter"` // RFC3339 expiry
+	IssuedAt string `json:"issuedAt"` // RFC3339 not-before
+}
+
 // Images is the set of resolved, pinned image references for a deployment's stack.
 type Images struct {
 	CoreServer      string `json:"coreServer"`
@@ -24,11 +49,33 @@ type Images struct {
 	Nginx           string `json:"nginx"`
 }
 
-// AddOns are the optional stack features toggled per deployment.
+// AddOns are the truly optional stack features toggled per deployment. nginx is NOT here — it is a
+// core service governed by DesiredState.Edge.
 type AddOns struct {
 	PgBackRest bool `json:"pgBackRest"` // premium; only meaningful with ModeManaged
 	Gitea      bool `json:"gitea"`
-	Nginx      bool `json:"nginx"` // edge proxy on customer VMs (shared edge on vm1 handles dev)
+}
+
+// SecretProviderAuth selects how the agent authenticates to the secret store. Non-secret params
+// (identity id, client id, token/key file paths, region, resource, username, ...) live in Params;
+// the SECRET half of each method (client secret, token, jwt, password, OCI private key/passphrase,
+// k8s service-account token) arrives on the SealedSecrets channel under a reserved name so cloud
+// never sees it. Method mirrors the Infisical SDK: universal | token | aws-iam | gcp-iam |
+// gcp-id-token | azure | kubernetes | kubernetes-token | oidc | jwt | ldap | oci.
+type SecretProviderAuth struct {
+	Method string            `json:"method"`
+	Params map[string]string `json:"params"`
+}
+
+// SecretProvider is the per-deployment secret store config CLOUD supplies (configured in cloud-web),
+// so the generic agent hardcodes nothing. Type is the backend (currently "infisical"); the rest
+// locates the store and picks the auth method.
+type SecretProvider struct {
+	Type      string             `json:"type"`
+	URL       string             `json:"url"`
+	ProjectID string             `json:"projectId"`
+	Env       string             `json:"env"`
+	Auth      SecretProviderAuth `json:"auth"`
 }
 
 // DesiredState is what cloud wants running; the agent reconciles toward it. Cloud SIGNS this
@@ -36,29 +83,34 @@ type AddOns struct {
 type DesiredState struct {
 	Generation    int64             `json:"generation"` // monotonic; agent skips reconcile if unchanged
 	DeploymentID  string            `json:"deploymentId"`
-	Version       string            `json:"version"`    // pinned catalog/app version reference
+	Version       string            `json:"version"` // pinned catalog/app version reference
 	Mode          DBMode            `json:"mode"`
-	BaseDomain    string            `json:"baseDomain"` // e.g. dev.vrittiai.com / apw1.vrittiai.com
-	Images        Images            `json:"images"`
-	AddOns        AddOns            `json:"addOns"`
-	Config        map[string]string `json:"config"`        // plaintext non-secret config (R2 bucket names, tunables)
-	SealedSecrets map[string]string `json:"sealedSecrets"` // name -> base64 sealed ciphertext (agent decrypts)
+	Edge          EdgeMode          `json:"edge"`        // managed = agent runs nginx+certbot; external = BYO edge
+	BaseDomain    string            `json:"baseDomain"`  // e.g. dev.vrittiai.com / apw1.vrittiai.com
+	Domains       []DomainRoute     `json:"domains"`     // hosts the managed edge serves + certs (ignored when Edge=external)
+	AcmeEmail     string            `json:"acmeEmail"`   // Let's Encrypt registration email (cloud-owned)
+	AcmeStaging   bool              `json:"acmeStaging"` // use the LE staging CA (avoids rate limits while testing)
+	Images         Images          `json:"images"`
+	AddOns         AddOns          `json:"addOns"`
+	SecretProvider *SecretProvider `json:"secretProvider"` // per-deployment secret store (cloud-provided); nil = none
+	Config         map[string]string `json:"config"`        // plaintext non-secret config (R2 bucket names, tunables)
+	SealedSecrets  map[string]string `json:"sealedSecrets"` // name -> base64 sealed ciphertext (agent decrypts)
 }
 
 // SignedDesiredState wraps DesiredState with cloud's signature over the canonical payload bytes.
 type SignedDesiredState struct {
-	Payload   DesiredState `json:"payload"`
-	PayloadB64 string      `json:"payloadB64"` // canonical JSON the signature is computed over
-	Signature string      `json:"signature"`  // base64 Ed25519 signature by the deployment key
+	Payload    DesiredState `json:"payload"`
+	PayloadB64 string       `json:"payloadB64"` // canonical JSON the signature is computed over
+	Signature  string       `json:"signature"`  // base64 Ed25519 signature by the deployment key
 }
 
 // EnrollRequest is sent once, presenting the one-time token and the agent's fresh public keys.
 type EnrollRequest struct {
-	DeploymentID   string `json:"deploymentId"`
-	EnrollToken    string `json:"enrollToken"`
-	SigningPubKey  string `json:"signingPubKey"` // agent Ed25519 public (agent→cloud auth)
-	SealingPubKey  string `json:"sealingPubKey"` // agent X25519 public (seal target)
-	AgentVersion   string `json:"agentVersion"`
+	DeploymentID  string `json:"deploymentId"`
+	EnrollToken   string `json:"enrollToken"`
+	SigningPubKey string `json:"signingPubKey"` // agent Ed25519 public (agent→cloud auth)
+	SealingPubKey string `json:"sealingPubKey"` // agent X25519 public (seal target)
+	AgentVersion  string `json:"agentVersion"`
 }
 
 // EnrollResponse returns the long-lived agent credential and the deployment public key used
@@ -88,11 +140,13 @@ type ContainerReport struct {
 
 // StatusReport is the periodic heartbeat the agent pushes to cloud.
 type StatusReport struct {
-	DeploymentID    string            `json:"deploymentId"`
-	Generation      int64             `json:"generation"` // desired-state generation currently applied
-	Phase           string            `json:"phase"`      // enrolled | reconciling | ready | error
-	Message         string            `json:"message"`
-	Containers      []ContainerReport `json:"containers"`
+	DeploymentID string            `json:"deploymentId"`
+	Generation   int64             `json:"generation"` // desired-state generation currently applied
+	Phase        string            `json:"phase"`      // enrolled | reconciling | ready | error
+	Message      string            `json:"message"`
+	Containers   []ContainerReport `json:"containers"`
 	// GiteaProvisioned tells core-server (via cloud) the Gitea user+PAT are stored.
 	GiteaProvisioned bool `json:"giteaProvisioned"`
+	// Certificates report each managed-edge cert's expiry so cloud can track/alert (system of record).
+	Certificates []CertReport `json:"certificates"`
 }

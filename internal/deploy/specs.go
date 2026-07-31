@@ -6,9 +6,7 @@ import (
 	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/cloudapi"
-	"github.com/vritti-ai-platforms/vritti-application-agent/internal/config"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
-	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
 )
 
 const mib = int64(1) << 20
@@ -32,7 +30,8 @@ func httpHealth(port int) *dockerx.HealthSpec {
 // command args and mount the pgbackrest config + local repo. Because archive_mode isn't
 // reloadable, toggling this changes the spec hash and the reconciler recreates the container
 // (a brief, deliberate restart) — which is exactly the required behavior.
-func PostgresSpec(ds cloudapi.DesiredState, cfg *config.Config, stackRoot string, archiving bool) dockerx.RunSpec {
+func PostgresSpec(ds cloudapi.DesiredState, conn DBConn, stackRoot string, archiving bool) dockerx.RunSpec {
+	// The container superuser IS the owner (matches local: POSTGRES_USER=vritti_core_owner).
 	binds := []string{filepath.Join(stackRoot, "pgdata") + ":/var/lib/postgresql/data"}
 	var cmd []string
 	if archiving {
@@ -53,9 +52,9 @@ func PostgresSpec(ds cloudapi.DesiredState, cfg *config.Config, stackRoot string
 		Service: SvcPostgres,
 		Image:   ds.Images.Postgres,
 		Env: []string{
-			"POSTGRES_USER=postgres",
-			"POSTGRES_PASSWORD=" + cfg.PostgresSuperPassword,
-			"POSTGRES_DB=vritti_core",
+			"POSTGRES_USER=" + conn.OwnerUser,
+			"POSTGRES_PASSWORD=" + conn.OwnerPassword,
+			"POSTGRES_DB=" + conn.Database,
 			"PGDATA=/var/lib/postgresql/data/pgdata",
 		},
 		Cmd:          cmd,
@@ -65,7 +64,7 @@ func PostgresSpec(ds cloudapi.DesiredState, cfg *config.Config, stackRoot string
 		Restart:      true,
 		MemLimit:     512 * mib,
 		Health: &dockerx.HealthSpec{
-			Test:     []string{"CMD-SHELL", "pg_isready -U postgres -d vritti_core"},
+			Test:     []string{"CMD-SHELL", "pg_isready -U " + conn.OwnerUser + " -d " + conn.Database},
 			Interval: 10 * time.Second,
 			Timeout:  5 * time.Second,
 			Retries:  5,
@@ -74,8 +73,8 @@ func PostgresSpec(ds cloudapi.DesiredState, cfg *config.Config, stackRoot string
 	}
 }
 
-// RedisSpec is the shared Redis with a machine-generated password.
-func RedisSpec(ds cloudapi.DesiredState, cfg *config.Config) dockerx.RunSpec {
+// RedisSpec is the shared Redis, password supplied from the `/agent` provisioning creds.
+func RedisSpec(ds cloudapi.DesiredState, redisPassword string) dockerx.RunSpec {
 	return dockerx.RunSpec{
 		Name:    SvcRedis,
 		Service: SvcRedis,
@@ -85,7 +84,7 @@ func RedisSpec(ds cloudapi.DesiredState, cfg *config.Config) dockerx.RunSpec {
 			"--maxmemory", "128mb",
 			"--maxmemory-policy", "allkeys-lru",
 			"--save", "",
-			"--requirepass", cfg.RedisPassword,
+			"--requirepass", redisPassword,
 		},
 		ExposedPorts: []string{"6379/tcp"},
 		Network:      Network,
@@ -149,7 +148,7 @@ func MigrateSpec(name, image string, env []string) dockerx.RunSpec {
 }
 
 // GiteaSpec runs the Gitea server backed by the shared vritti_core DB in its own `gitea` schema.
-func GiteaSpec(ds cloudapi.DesiredState, m *secrets.Machine, db DBConn, stackRoot string) dockerx.RunSpec {
+func GiteaSpec(ds cloudapi.DesiredState, db DBConn, stackRoot string) dockerx.RunSpec {
 	domain := "git." + ds.BaseDomain
 	env := []string{
 		"GITEA__database__DB_TYPE=postgres",
@@ -194,7 +193,8 @@ func GiteaSpec(ds cloudapi.DesiredState, m *secrets.Machine, db DBConn, stackRoo
 // container — archive_command continuously, and `pgbackrest backup` via `docker exec` on the
 // agent's schedule (see pgbackrest.go). There is no pgbackrest container to manage.
 
-// NginxSpec is the edge proxy for customer/prod VMs (dev on vm1 uses a shared edge instead).
+// NginxSpec is the managed edge (Edge=managed). It serves conf.d/vritti.conf, reads Let's Encrypt
+// certs from the shared letsencrypt dir, and serves the ACME webroot for HTTP-01 renewals.
 func NginxSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
 	return dockerx.RunSpec{
 		Name:    SvcNginx,
@@ -202,7 +202,8 @@ func NginxSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
 		Image:   ds.Images.Nginx,
 		Binds: []string{
 			filepath.Join(stackRoot, "nginx", "conf.d") + ":/etc/nginx/conf.d:ro",
-			filepath.Join(stackRoot, "ssl") + ":/etc/nginx/ssl:ro",
+			filepath.Join(stackRoot, leDir) + ":/etc/letsencrypt:ro",
+			filepath.Join(stackRoot, leDir, "www") + ":/var/www/letsencrypt:ro",
 			filepath.Join(stackRoot, "logs", "nginx") + ":/var/log/nginx",
 		},
 		Ports:    map[string]string{"80/tcp": "80", "443/tcp": "443"},

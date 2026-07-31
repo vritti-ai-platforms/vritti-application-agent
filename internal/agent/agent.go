@@ -1,9 +1,9 @@
 // Package agent is the top-level orchestration loop. It wires the pieces together and, on
 // every desired-state generation, sequences the deterministic reconcile:
 //
-//	verify signature → decrypt sealed secrets → resolve DB (mode branch) → ensure infra →
-//	provision managed DB → run migrations → reconcile services → provision Gitea add-on →
-//	prune stragglers → report status.
+//	verify signature → fetch each service's env from the secret provider → derive provisioning creds →
+//	resolve DB (mode branch) → ensure infra → provision managed DB → run migrations →
+//	reconcile services → provision Gitea add-on → prune stragglers → report status.
 package agent
 
 import (
@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/agentcrypto"
@@ -21,6 +22,7 @@ import (
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/enroll"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/gitea"
+	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secretprovider"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
 )
 
@@ -29,6 +31,10 @@ const Version = "0.1.0"
 
 // externalDBSecret is the reserved sealed-secret name carrying the external DB connection.
 const externalDBSecret = "external_db"
+
+// secretProviderPrefix marks sealed secrets that carry the SECRET half of the secret-store auth
+// method. The suffix after the prefix is the reserved auth-secret name (clientSecret, token, ...).
+const secretProviderPrefix = "secretProvider."
 
 // Agent holds the long-lived collaborators for one deployment.
 type Agent struct {
@@ -41,8 +47,10 @@ type Agent struct {
 	enrollment *cloudapi.Enrollment
 
 	lastGeneration int64
-	archiving      bool // pgBackRest add-on currently enabled (drives the backup ticker)
-	hadFullBackup  bool // a full backup has been taken since archiving was enabled
+	archiving      bool                  // pgBackRest add-on currently enabled (drives the backup ticker)
+	hadFullBackup  bool                  // a full backup has been taken since archiving was enabled
+	edgeManaged    bool                  // agent runs nginx+certbot (drives the cert-renewal ticker)
+	certs          []cloudapi.CertReport // last observed managed-edge certs (reported each heartbeat)
 }
 
 // New bootstraps the agent: loads config, local keys, machine secrets, and the Docker client.
@@ -63,8 +71,7 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	cloud := cloudapi.New(cfg.CloudURL, cfg.DeploymentID, keys)
-	cloud.SetAccessServiceToken(cfg.CFAccessClientID, cfg.CFAccessClientSecret)
+	cloud := cloudapi.New(cfg.CloudAPIURL, cfg.DeploymentID, keys)
 
 	return &Agent{cfg: cfg, log: log, keys: keys, machine: machine, dx: dx, cloud: cloud}, nil
 }
@@ -88,6 +95,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer backupTicker.Stop()
 	backupTick := 0
 
+	// Cert renewal (only fires when the managed edge is active): certbot renew no-ops until a cert
+	// is within its renewal window, then reloads nginx.
+	certTicker := time.NewTicker(12 * time.Hour)
+	defer certTicker.Stop()
+
 	a.tick(ctx) // reconcile immediately on boot
 	for {
 		select {
@@ -106,6 +118,12 @@ func (a *Agent) Run(ctx context.Context) error {
 					a.log.Warn("scheduled backup failed", "type", bt, "err", err)
 				} else {
 					a.log.Info("scheduled backup complete", "type", bt)
+				}
+			}
+		case <-certTicker.C:
+			if a.edgeManaged {
+				if err := deploy.RenewCerts(ctx, a.dx, a.cfg.StackRoot); err != nil {
+					a.log.Warn("cert renewal failed", "err", err)
 				}
 			}
 		}
@@ -137,32 +155,66 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	}
 	ds := signed.Payload
 
-	// (2) Decrypt sealed secrets locally. external_db is consumed for the DB connection; the rest
-	// (R2 keys, etc.) merge into the plaintext config passed to the containers as env.
-	resolved := map[string]string{}
-	for k, v := range ds.Config {
-		resolved[k] = v
-	}
+	// (2) Decrypt the sealed secrets once. Names prefixed `secretProvider.` carry the SECRET half of
+	// the secret-store auth method (client secret, token, jwt, ...) — strip the prefix into
+	// authSecrets. The reserved `external_db` name carries the external-mode DB connection.
+	authSecrets := map[string]string{}
 	var externalSecret []byte
 	for name, ciphertext := range ds.SealedSecrets {
 		plain, err := a.keys.OpenSealed(ciphertext)
 		if err != nil {
 			return false, fmt.Errorf("open sealed secret %q: %w", name, err)
 		}
-		if name == externalDBSecret {
+		switch {
+		case strings.HasPrefix(name, secretProviderPrefix):
+			authSecrets[strings.TrimPrefix(name, secretProviderPrefix)] = string(plain)
+		case name == externalDBSecret:
 			externalSecret = plain
-			continue
 		}
-		resolved[name] = string(plain)
 	}
 
-	// (3) Resolve the DB connection — the mode branch.
-	db, err := deploy.ResolveDBConn(ds, a.cfg, externalSecret)
+	// (3) Build the secret provider from the cloud-signed desired-state (connection + auth method come
+	// from cloud, never from env/ansible), then read each service's COMPLETE container env through it
+	// (imports merged, refs expanded). coreEnv/commerceEnv ARE the container envs; agentEnv holds only
+	// the raw provisioning creds (data-store passwords + Gitea admin bootstrap) to stand up the infra.
+	if ds.SecretProvider == nil {
+		return false, fmt.Errorf("desired-state has no secretProvider — Model B requires a cloud-configured secret store")
+	}
+	provider, err := secretprovider.New(ctx, *ds.SecretProvider, authSecrets)
+	if err != nil {
+		return false, fmt.Errorf("secret provider: %w", err)
+	}
+	coreEnv, err := provider.Fetch(ctx, "/core-server")
+	if err != nil {
+		return false, fmt.Errorf("secrets /core-server: %w", err)
+	}
+	commerceEnv, err := provider.Fetch(ctx, "/commerce-service")
+	if err != nil {
+		return false, fmt.Errorf("secrets /commerce-service: %w", err)
+	}
+	agentEnv, err := provider.Fetch(ctx, "/agent")
+	if err != nil {
+		return false, fmt.Errorf("secrets /agent: %w", err)
+	}
+
+	// (4) Derive the managed-mode provisioning values + Gitea admin creds from the `/agent` map.
+	prov := deploy.ManagedProvisioning{
+		DBName:        agentEnv["DB_NAME"],
+		OwnerPassword: agentEnv["DB_OWNER_PASSWORD"],
+		AppPassword:   agentEnv["DB_APP_PASSWORD"],
+		GiteaPassword: agentEnv["DB_GITEA_PASSWORD"],
+		RedisPassword: agentEnv["REDIS_PASSWORD"],
+	}
+	giteaAdminUser := agentEnv["GITEA_ADMIN_USER"]
+	giteaAdminPw := agentEnv["GITEA_ADMIN_PASSWORD"]
+
+	// (5) Resolve the DB connection — the mode branch (managed = provisioning creds, external = sealed).
+	db, err := deploy.ResolveDBConn(ds, prov, externalSecret)
 	if err != nil {
 		return false, err
 	}
 
-	// (4) Ensure infra: network + host bind directories.
+	// (6) Ensure infra: network + host bind directories.
 	if err := a.dx.EnsureNetwork(ctx, deploy.Network); err != nil {
 		return false, err
 	}
@@ -174,19 +226,20 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 
 	keep := map[string]bool{}
 
-	// (5) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
+	// (7) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
 	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
 	archiving := ds.Mode == cloudapi.ModeManaged && ds.AddOns.PgBackRest
 	if ds.Mode == cloudapi.ModeManaged {
 		if archiving {
 			// Config must exist before Postgres boots so archive_command works from the first WAL.
-			conf := deploy.RenderPgBackRestConf(ds, a.machine, resolved)
+			// R2 repo creds ride in core-server's env map (R2_*), so read the backup target from there.
+			conf := deploy.RenderPgBackRestConf(ds, a.machine, coreEnv)
 			confPath := filepath.Join(a.cfg.StackRoot, "pgbackrest", "pgbackrest.conf")
 			if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
 				return false, err
 			}
 		}
-		pg := deploy.PostgresSpec(ds, a.cfg, a.cfg.StackRoot, archiving)
+		pg := deploy.PostgresSpec(ds, db, a.cfg.StackRoot, archiving)
 		if err := deploy.Apply(ctx, a.dx, pg); err != nil {
 			return false, fmt.Errorf("postgres: %w", err)
 		}
@@ -194,7 +247,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 		if err := a.dx.WaitHealthy(ctx, deploy.SvcPostgres, 90*time.Second); err != nil {
 			return false, err
 		}
-		if err := deploy.EnsureManagedDatabase(ctx, a.dx, a.cfg); err != nil {
+		if err := deploy.EnsureManagedDatabase(ctx, a.dx, db); err != nil {
 			return false, err
 		}
 		if archiving {
@@ -211,29 +264,26 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	}
 	a.archiving = archiving
 
-	// (6) Run migrations (owner conn) to completion before the app services roll.
-	coreEnvBase := deploy.CoreEnvInput{
-		Desired: ds, Machine: a.machine, DB: db, RedisPassword: a.cfg.RedisPassword,
-		ResolvedConfig: resolved,
-	}
-	if err := a.migrate(ctx, ds, coreEnvBase, resolved, db); err != nil {
+	// (8) Render the commerce env verbatim, then run migrations (owner conn) to completion before the
+	// app services roll. core-migrate runs without the Gitea additions (they aren't needed for DDL).
+	commerceEnvSlice := deploy.RenderServiceEnv(commerceEnv)
+	if err := a.migrate(ctx, ds, deploy.RenderCoreEnv(coreEnv, "", ""), commerceEnvSlice); err != nil {
 		return false, err
 	}
 
-	// (7) Reconcile the core long-running services.
-	serviceEnv := deploy.RenderServiceEnv(ds, a.machine, db, resolved)
+	// (9) Reconcile the core long-running services.
 	longRunning := []dockerx.RunSpec{
-		deploy.RedisSpec(ds, a.cfg),
+		deploy.RedisSpec(ds, prov.RedisPassword),
 		deploy.NatsSpec(ds),
-		deploy.CommerceServiceSpec(ds, serviceEnv),
+		deploy.CommerceServiceSpec(ds, commerceEnvSlice),
 	}
 
-	// (8) Gitea add-on: start it, then bootstrap the admin token BEFORE rendering core's env so
-	// core boots already knowing GITEA_URL + GITEA_ADMIN_TOKEN and can create the app user + PAT.
+	// (10) Gitea add-on: start it, then bootstrap the admin token BEFORE rendering core's env so
+	// core boots already knowing GITEA_BASE_URL + GITEA_ADMIN_TOKEN and can create the app user + PAT.
 	giteaProvisioned := false
 	giteaURL, giteaToken := "", ""
 	if ds.AddOns.Gitea {
-		giteaSpec := deploy.GiteaSpec(ds, a.machine, db, a.cfg.StackRoot)
+		giteaSpec := deploy.GiteaSpec(ds, db, a.cfg.StackRoot)
 		if err := deploy.Apply(ctx, a.dx, giteaSpec); err != nil {
 			return false, fmt.Errorf("gitea: %w", err)
 		}
@@ -241,7 +291,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 		if err := a.dx.WaitHealthy(ctx, deploy.SvcGitea, 90*time.Second); err != nil {
 			return false, err
 		}
-		token, err := gitea.ProvisionAdminToken(ctx, a.dx, a.cfg, a.cfg.DataDir)
+		token, err := gitea.ProvisionAdminToken(ctx, a.dx, giteaAdminUser, giteaAdminPw, a.cfg.DataDir)
 		if err != nil {
 			return false, err
 		}
@@ -251,16 +301,8 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	}
 
 	// core-server rendered last so it carries the Gitea admin token when the add-on is on.
-	coreEnvBase.GiteaURL = giteaURL
-	coreEnvBase.GiteaAdminToken = giteaToken
-	coreEnv := deploy.RenderCoreEnv(coreEnvBase)
-	longRunning = append(longRunning, deploy.CoreServerSpec(ds, coreEnv, a.cfg.StackRoot))
-
-	// (9) nginx (edge) add-on. pgBackRest is NOT a container — archiving lives in the Postgres
-	// spec (step 5) and scheduled backups run via `docker exec` on the backup ticker.
-	if ds.AddOns.Nginx {
-		longRunning = append(longRunning, deploy.NginxSpec(ds, a.cfg.StackRoot))
-	}
+	coreEnvSlice := deploy.RenderCoreEnv(coreEnv, giteaURL, giteaToken)
+	longRunning = append(longRunning, deploy.CoreServerSpec(ds, coreEnvSlice, a.cfg.StackRoot))
 
 	for _, spec := range longRunning {
 		if err := deploy.Apply(ctx, a.dx, spec); err != nil {
@@ -269,7 +311,23 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 		keep[spec.Name] = true
 	}
 
-	// (10) Prune anything we own that is no longer in the desired set (e.g. a disabled add-on).
+	// (11) Managed edge (core service): nginx + certbot for the provided domains. Edge=external means
+	// something else fronts core (shared vm1 edge, a customer LB, a tunnel) — no nginx, no certbot.
+	// pgBackRest is NOT a container — archiving lives in the Postgres spec (step 5) and scheduled
+	// backups run via `docker exec` on the backup ticker.
+	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal
+	if a.edgeManaged {
+		certs, err := deploy.EnsureEdge(ctx, a.dx, ds, a.cfg.StackRoot)
+		if err != nil {
+			return giteaProvisioned, err
+		}
+		a.certs = certs
+		keep[deploy.SvcNginx] = true
+	} else {
+		a.certs = nil
+	}
+
+	// (12) Prune anything we own that is no longer in the desired set (e.g. a disabled add-on).
 	if err := a.dx.PruneExcept(ctx, keep); err != nil {
 		return giteaProvisioned, err
 	}
@@ -278,18 +336,17 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	return giteaProvisioned, nil
 }
 
-// migrate runs the core + commerce one-shot migration containers to completion.
-func (a *Agent) migrate(ctx context.Context, ds cloudapi.DesiredState, coreEnvBase deploy.CoreEnvInput, resolved map[string]string, db deploy.DBConn) error {
-	coreEnv := deploy.RenderCoreEnv(coreEnvBase)
-	serviceEnv := deploy.RenderServiceEnv(ds, a.machine, db, resolved)
-
+// migrate runs the core + commerce one-shot migration containers to completion. Each runner reads
+// its owner connection (PRIMARY_DB_DATABASE_DIRECT_URL) + app role (PRIMARY_DB_USERNAME) straight
+// from its Infisical env map.
+func (a *Agent) migrate(ctx context.Context, ds cloudapi.DesiredState, coreEnv, commerceEnv []string) error {
 	runs := []struct {
 		name  string
 		image string
 		env   []string
 	}{
 		{"core-migrate", ds.Images.CoreServer, coreEnv},
-		{"commerce-migrate", ds.Images.CommerceService, serviceEnv},
+		{"commerce-migrate", ds.Images.CommerceService, commerceEnv},
 	}
 	for _, r := range runs {
 		spec := deploy.MigrateSpec(r.name, r.image, r.env)
@@ -327,6 +384,7 @@ func (a *Agent) report(ctx context.Context, generation int64, phase, msg string,
 		Message:          msg,
 		Containers:       containers,
 		GiteaProvisioned: giteaOK,
+		Certificates:     a.certs,
 	})
 	if err != nil {
 		a.log.Warn("status report failed", "err", err)
