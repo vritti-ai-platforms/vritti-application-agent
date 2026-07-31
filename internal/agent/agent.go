@@ -64,6 +64,7 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 		return nil, err
 	}
 	cloud := cloudapi.New(cfg.CloudURL, cfg.DeploymentID, keys)
+	cloud.SetAccessServiceToken(cfg.CFAccessClientID, cfg.CFAccessClientSecret)
 
 	return &Agent{cfg: cfg, log: log, keys: keys, machine: machine, dx: dx, cloud: cloud}, nil
 }
@@ -156,7 +157,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	}
 
 	// (3) Resolve the DB connection — the mode branch.
-	db, err := deploy.ResolveDBConn(ds, a.machine, externalSecret)
+	db, err := deploy.ResolveDBConn(ds, a.cfg, externalSecret)
 	if err != nil {
 		return false, err
 	}
@@ -185,7 +186,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 				return false, err
 			}
 		}
-		pg := deploy.PostgresSpec(ds, a.machine, a.cfg.StackRoot, archiving)
+		pg := deploy.PostgresSpec(ds, a.cfg, a.cfg.StackRoot, archiving)
 		if err := deploy.Apply(ctx, a.dx, pg); err != nil {
 			return false, fmt.Errorf("postgres: %w", err)
 		}
@@ -193,7 +194,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 		if err := a.dx.WaitHealthy(ctx, deploy.SvcPostgres, 90*time.Second); err != nil {
 			return false, err
 		}
-		if err := deploy.EnsureManagedDatabase(ctx, a.dx, a.machine); err != nil {
+		if err := deploy.EnsureManagedDatabase(ctx, a.dx, a.cfg); err != nil {
 			return false, err
 		}
 		if archiving {
@@ -212,8 +213,8 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 
 	// (6) Run migrations (owner conn) to completion before the app services roll.
 	coreEnvBase := deploy.CoreEnvInput{
-		Desired: ds, Machine: a.machine, DB: db,
-		DeploymentPubKey: a.enrollment.DeploymentPubKey, ResolvedConfig: resolved,
+		Desired: ds, Machine: a.machine, DB: db, RedisPassword: a.cfg.RedisPassword,
+		ResolvedConfig: resolved,
 	}
 	if err := a.migrate(ctx, ds, coreEnvBase, resolved, db); err != nil {
 		return false, err
@@ -222,7 +223,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 	// (7) Reconcile the core long-running services.
 	serviceEnv := deploy.RenderServiceEnv(ds, a.machine, db, resolved)
 	longRunning := []dockerx.RunSpec{
-		deploy.RedisSpec(ds, a.machine),
+		deploy.RedisSpec(ds, a.cfg),
 		deploy.NatsSpec(ds),
 		deploy.CommerceServiceSpec(ds, serviceEnv),
 	}
@@ -240,7 +241,7 @@ func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredSta
 		if err := a.dx.WaitHealthy(ctx, deploy.SvcGitea, 90*time.Second); err != nil {
 			return false, err
 		}
-		token, err := gitea.ProvisionAdminToken(ctx, a.dx, a.machine, a.cfg.DataDir)
+		token, err := gitea.ProvisionAdminToken(ctx, a.dx, a.cfg, a.cfg.DataDir)
 		if err != nil {
 			return false, err
 		}

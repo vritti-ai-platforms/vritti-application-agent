@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/cloudapi"
-	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
+	"github.com/vritti-ai-platforms/vritti-application-agent/internal/config"
 )
 
 // Network is the private bridge every service in a core deployment shares.
@@ -35,6 +35,8 @@ type DBConn struct {
 	AppPassword   string
 	OwnerUser     string
 	OwnerPassword string
+	GiteaUser     string
+	GiteaPassword string
 	SSLMode       string
 }
 
@@ -44,16 +46,18 @@ func (d DBConn) DirectURL() string {
 		d.OwnerUser, d.OwnerPassword, d.Host, d.Port, d.Database, d.SSLMode)
 }
 
-// ManagedDBConn builds the connection for the containerized Postgres (agent-generated creds).
-func ManagedDBConn(m *secrets.Machine) DBConn {
+// ManagedDBConn builds the connection for the containerized Postgres (creds supplied via config).
+func ManagedDBConn(cfg *config.Config) DBConn {
 	return DBConn{
 		Host:          SvcPostgres,
 		Port:          "5432",
 		Database:      "vritti_core",
 		AppUser:       "vritti_core_app",
-		AppPassword:   m.DBAppPassword,
+		AppPassword:   cfg.DBAppPassword,
 		OwnerUser:     "vritti_core_owner",
-		OwnerPassword: m.DBOwnerPassword,
+		OwnerPassword: cfg.DBOwnerPassword,
+		GiteaUser:     "gitea",
+		GiteaPassword: cfg.DBGiteaPassword,
 		SSLMode:       "disable",
 	}
 }
@@ -67,6 +71,8 @@ type ExternalDB struct {
 	OwnerPassword string `json:"ownerPassword"`
 	AppUser       string `json:"appUser"`
 	AppPassword   string `json:"appPassword"`
+	GiteaUser     string `json:"giteaUser"`
+	GiteaPassword string `json:"giteaPassword"`
 	SSLMode       string `json:"sslMode"`
 }
 
@@ -82,6 +88,9 @@ func ExternalDBConn(decrypted []byte) (DBConn, error) {
 	if e.SSLMode == "" {
 		e.SSLMode = "require"
 	}
+	if e.GiteaUser == "" {
+		e.GiteaUser = "gitea"
+	}
 	return DBConn{
 		Host:          e.Host,
 		Port:          e.Port,
@@ -90,17 +99,19 @@ func ExternalDBConn(decrypted []byte) (DBConn, error) {
 		AppPassword:   e.AppPassword,
 		OwnerUser:     e.OwnerUser,
 		OwnerPassword: e.OwnerPassword,
+		GiteaUser:     e.GiteaUser,
+		GiteaPassword: e.GiteaPassword,
 		SSLMode:       e.SSLMode,
 	}, nil
 }
 
 // ResolveDBConn returns the DBConn for the deployment's mode. For external mode the caller
 // supplies the already-decrypted sealed secret bytes.
-func ResolveDBConn(ds cloudapi.DesiredState, m *secrets.Machine, externalSecret []byte) (DBConn, error) {
+func ResolveDBConn(ds cloudapi.DesiredState, cfg *config.Config, externalSecret []byte) (DBConn, error) {
 	if ds.Mode == cloudapi.ModeExternal {
 		return ExternalDBConn(externalSecret)
 	}
-	return ManagedDBConn(m), nil
+	return ManagedDBConn(cfg), nil
 }
 
 // Dirs returns the host bind-mount directories that must exist before containers start.

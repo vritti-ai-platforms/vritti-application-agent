@@ -13,8 +13,8 @@ type CoreEnvInput struct {
 	Desired          cloudapi.DesiredState
 	Machine          *secrets.Machine
 	DB               DBConn
-	DeploymentPubKey string            // → CLOUD_PUBLIC_KEY (core verifies catalog/entitlement with it)
-	ResolvedConfig   map[string]string // plaintext config + decrypted sealed secrets (R2, etc.)
+	RedisPassword    string            // → REDIS_URL (config-supplied, not machine-generated)
+	ResolvedConfig   map[string]string // plaintext config + decrypted sealed secrets (incl. LICENSE_PUBLIC_KEY, R2, etc.)
 	GiteaURL         string            // set when the Gitea add-on is provisioned
 	GiteaAdminToken  string            // bootstrap admin token handed to core so it can create the app user+PAT
 }
@@ -25,17 +25,16 @@ func RenderCoreEnv(in CoreEnvInput) []string {
 	env["NODE_ENV"] = "production"
 	env["PORT"] = "3002"
 	env["DEPLOYMENT_ID"] = in.Desired.DeploymentID
-	env["CLOUD_PUBLIC_KEY"] = in.DeploymentPubKey
 	env["BASE_DOMAIN"] = in.Desired.BaseDomain
 	env["JWT_SECRET"] = in.Machine.JWTSecret
 	env["HMAC_KEY"] = in.Machine.HMACKey
 	env["COOKIE_SECRET"] = in.Machine.CookieSecret
-	env["REDIS_URL"] = fmt.Sprintf("redis://:%s@%s:6379", in.Machine.RedisPassword, SvcRedis)
+	env["REDIS_URL"] = fmt.Sprintf("redis://:%s@%s:6379", in.RedisPassword, SvcRedis)
 	env["NATS_URL"] = fmt.Sprintf("nats://%s:4222", SvcNats)
 
 	if in.GiteaURL != "" {
 		// core-server creates the app git user + PAT via this admin token, then stores them in vritti_core.
-		env["GITEA_URL"] = in.GiteaURL
+		env["GITEA_BASE_URL"] = in.GiteaURL
 		env["GITEA_ADMIN_TOKEN"] = in.GiteaAdminToken
 	}
 

@@ -1,8 +1,9 @@
 // Package secrets generates and persists the deployment's MACHINE secrets on the VM.
 //
-// These values are created here, by the agent, and never travel to cloud: DB passwords,
-// the app crypto secrets (JWT/HMAC/COOKIE), the Redis password, and the Gitea admin
-// bootstrap credentials. Cloud stores config + sealed human secrets only — never these.
+// These values are created here, by the agent, and never travel to cloud: the app crypto
+// secrets (JWT/HMAC/COOKIE) and the pgBackRest cipher pass. Cloud stores config + sealed human
+// secrets only — never these. Data-store passwords (Postgres + Redis) and the Gitea admin
+// password are NOT here: they are supplied via config (env file / Infisical agent folder).
 package secrets
 
 import (
@@ -16,16 +17,10 @@ import (
 
 // Machine is the set of locally generated secrets, persisted once and reused across reconciles.
 type Machine struct {
-	PostgresSuperPassword string `json:"postgresSuperPassword"`
-	DBOwnerPassword       string `json:"dbOwnerPassword"`
-	DBAppPassword         string `json:"dbAppPassword"`
-	JWTSecret             string `json:"jwtSecret"`
-	HMACKey               string `json:"hmacKey"`
-	CookieSecret          string `json:"cookieSecret"`
-	RedisPassword         string `json:"redisPassword"`
-	GiteaAdminUser        string `json:"giteaAdminUser"`
-	GiteaAdminPassword    string `json:"giteaAdminPassword"`
-	PgBackRestCipherPass  string `json:"pgBackRestCipherPass"`
+	JWTSecret            string `json:"jwtSecret"`
+	HMACKey              string `json:"hmacKey"`
+	CookieSecret         string `json:"cookieSecret"`
+	PgBackRestCipherPass string `json:"pgBackRestCipherPass"`
 }
 
 // LoadOrCreate returns the persisted machine secrets, generating them on first run.
@@ -44,16 +39,10 @@ func LoadOrCreate(dir string) (*Machine, error) {
 	}
 
 	m := &Machine{
-		PostgresSuperPassword: randHex(24),
-		DBOwnerPassword:       randHex(24),
-		DBAppPassword:         randHex(24),
-		JWTSecret:             randB64(32),
-		HMACKey:               randB64(32),
-		CookieSecret:          randB64(32),
-		RedisPassword:         randHex(24),
-		GiteaAdminUser:        "vritti-admin",
-		GiteaAdminPassword:    randHex(24),
-		PgBackRestCipherPass:  randHex(32),
+		JWTSecret:            randB64(32),
+		HMACKey:              randB64(32),
+		CookieSecret:         randB64(32),
+		PgBackRestCipherPass: randHex(32),
 	}
 	blob, _ := json.MarshalIndent(m, "", "  ")
 	if err := os.WriteFile(path, blob, 0o600); err != nil {

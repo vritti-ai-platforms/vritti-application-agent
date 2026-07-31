@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/cloudapi"
+	"github.com/vritti-ai-platforms/vritti-application-agent/internal/config"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
 )
@@ -31,7 +32,7 @@ func httpHealth(port int) *dockerx.HealthSpec {
 // command args and mount the pgbackrest config + local repo. Because archive_mode isn't
 // reloadable, toggling this changes the spec hash and the reconciler recreates the container
 // (a brief, deliberate restart) — which is exactly the required behavior.
-func PostgresSpec(ds cloudapi.DesiredState, m *secrets.Machine, stackRoot string, archiving bool) dockerx.RunSpec {
+func PostgresSpec(ds cloudapi.DesiredState, cfg *config.Config, stackRoot string, archiving bool) dockerx.RunSpec {
 	binds := []string{filepath.Join(stackRoot, "pgdata") + ":/var/lib/postgresql/data"}
 	var cmd []string
 	if archiving {
@@ -53,7 +54,7 @@ func PostgresSpec(ds cloudapi.DesiredState, m *secrets.Machine, stackRoot string
 		Image:   ds.Images.Postgres,
 		Env: []string{
 			"POSTGRES_USER=postgres",
-			"POSTGRES_PASSWORD=" + m.PostgresSuperPassword,
+			"POSTGRES_PASSWORD=" + cfg.PostgresSuperPassword,
 			"POSTGRES_DB=vritti_core",
 			"PGDATA=/var/lib/postgresql/data/pgdata",
 		},
@@ -74,7 +75,7 @@ func PostgresSpec(ds cloudapi.DesiredState, m *secrets.Machine, stackRoot string
 }
 
 // RedisSpec is the shared Redis with a machine-generated password.
-func RedisSpec(ds cloudapi.DesiredState, m *secrets.Machine) dockerx.RunSpec {
+func RedisSpec(ds cloudapi.DesiredState, cfg *config.Config) dockerx.RunSpec {
 	return dockerx.RunSpec{
 		Name:    SvcRedis,
 		Service: SvcRedis,
@@ -84,7 +85,7 @@ func RedisSpec(ds cloudapi.DesiredState, m *secrets.Machine) dockerx.RunSpec {
 			"--maxmemory", "128mb",
 			"--maxmemory-policy", "allkeys-lru",
 			"--save", "",
-			"--requirepass", m.RedisPassword,
+			"--requirepass", cfg.RedisPassword,
 		},
 		ExposedPorts: []string{"6379/tcp"},
 		Network:      Network,
@@ -154,8 +155,8 @@ func GiteaSpec(ds cloudapi.DesiredState, m *secrets.Machine, db DBConn, stackRoo
 		"GITEA__database__DB_TYPE=postgres",
 		fmt.Sprintf("GITEA__database__HOST=%s:%s", db.Host, db.Port),
 		"GITEA__database__NAME=" + db.Database,
-		"GITEA__database__USER=" + db.OwnerUser,
-		"GITEA__database__PASSWD=" + db.OwnerPassword,
+		"GITEA__database__USER=" + db.GiteaUser,
+		"GITEA__database__PASSWD=" + db.GiteaPassword,
 		"GITEA__database__SCHEMA=gitea",
 		"GITEA__database__SSL_MODE=" + db.SSLMode,
 		"GITEA__server__DOMAIN=" + domain,

@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/vritti-ai-platforms/vritti-application-agent/internal/config"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
-	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
 )
 
 // state is the persisted admin token so we never regenerate (Gitea rejects duplicate token names).
@@ -25,7 +25,7 @@ const containerName = "gitea"
 const tokenName = "vritti-agent-bootstrap"
 
 // ProvisionAdminToken ensures a Gitea admin exists and returns a stable admin API token.
-func ProvisionAdminToken(ctx context.Context, dx *dockerx.Client, m *secrets.Machine, stateDir string) (string, error) {
+func ProvisionAdminToken(ctx context.Context, dx *dockerx.Client, cfg *config.Config, stateDir string) (string, error) {
 	statePath := filepath.Join(stateDir, "gitea-state.json")
 	if data, err := os.ReadFile(statePath); err == nil {
 		var s state
@@ -34,10 +34,10 @@ func ProvisionAdminToken(ctx context.Context, dx *dockerx.Client, m *secrets.Mac
 		}
 	}
 
-	if err := ensureAdmin(ctx, dx, m); err != nil {
+	if err := ensureAdmin(ctx, dx, cfg); err != nil {
 		return "", err
 	}
-	token, err := generateToken(ctx, dx, m)
+	token, err := generateToken(ctx, dx, cfg)
 	if err != nil {
 		return "", err
 	}
@@ -53,10 +53,10 @@ func ProvisionAdminToken(ctx context.Context, dx *dockerx.Client, m *secrets.Mac
 }
 
 // ensureAdmin creates the admin user, treating "already exists" as success.
-func ensureAdmin(ctx context.Context, dx *dockerx.Client, m *secrets.Machine) error {
+func ensureAdmin(ctx context.Context, dx *dockerx.Client, cfg *config.Config) error {
 	cmd := giteaCLI(fmt.Sprintf(
 		"gitea admin user create --admin --username %s --password %s --email %s@vritti.local --must-change-password=false",
-		m.GiteaAdminUser, m.GiteaAdminPassword, m.GiteaAdminUser,
+		cfg.GiteaAdminUser, cfg.GiteaAdminPassword, cfg.GiteaAdminUser,
 	))
 	code, out, err := dx.Exec(ctx, containerName, cmd)
 	if err != nil {
@@ -69,10 +69,10 @@ func ensureAdmin(ctx context.Context, dx *dockerx.Client, m *secrets.Machine) er
 }
 
 // generateToken mints an all-scopes admin token and returns the raw value.
-func generateToken(ctx context.Context, dx *dockerx.Client, m *secrets.Machine) (string, error) {
+func generateToken(ctx context.Context, dx *dockerx.Client, cfg *config.Config) (string, error) {
 	cmd := giteaCLI(fmt.Sprintf(
 		"gitea admin user generate-access-token --username %s --scopes all --token-name %s --raw",
-		m.GiteaAdminUser, tokenName,
+		cfg.GiteaAdminUser, tokenName,
 	))
 	code, out, err := dx.Exec(ctx, containerName, cmd)
 	if err != nil {
