@@ -95,6 +95,13 @@ func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredStat
 			return nil, err
 		}
 	}
+	// nginx workers (user `nginx`, non-root) serve the ACME webroot, so it must be world-traversable.
+	// MkdirAll leaves it 0750/root and the worker fails with open() "(13: Permission denied)", which
+	// Let's Encrypt sees as a 403 on the HTTP-01 challenge. certbot writes the challenge dir + files
+	// world-readable itself, so 0755 on the webroot is all that's needed.
+	if err := os.Chmod(filepath.Join(stackRoot, leDir, "www"), 0o755); err != nil {
+		return nil, err
+	}
 
 	// Render (cert-aware) + start nginx so :80 answers the HTTP-01 challenge before certbot runs.
 	if err := writeNginxConf(stackRoot, ds.Domains); err != nil {
