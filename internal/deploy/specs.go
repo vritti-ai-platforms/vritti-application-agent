@@ -3,6 +3,8 @@ package deploy
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/cloudapi"
@@ -10,6 +12,24 @@ import (
 )
 
 const mib = int64(1) << 20
+
+// DefaultCorePort is the fallback HTTP port for core-server when its env carries no PORT. Real
+// deployments set PORT from the secret store; the healthcheck + exposed port derive from that so
+// they always track the configured port instead of a hardcoded value (see envPort).
+const DefaultCorePort = 3002
+
+// envPort reads a PORT=<n> entry from a KEY=VALUE env slice, returning the fallback when absent or
+// unparseable. Keeps the healthcheck/exposed port in lockstep with the port the app actually binds.
+func envPort(env []string, fallback int) int {
+	for _, kv := range env {
+		if name, val, ok := strings.Cut(kv, "="); ok && name == "PORT" {
+			if p, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && p > 0 {
+				return p
+			}
+		}
+	}
+	return fallback
+}
 
 // wget-based HTTP healthcheck for the node services.
 func httpHealth(port int) *dockerx.HealthSpec {
@@ -106,19 +126,22 @@ func NatsSpec(ds cloudapi.DesiredState) dockerx.RunSpec {
 	}
 }
 
-// CoreServerSpec is the core-server HTTP API.
+// CoreServerSpec is the core-server HTTP API. Its HTTP port comes from the env's PORT so the
+// healthcheck + exposed port track the port the app actually binds (nginx must proxy to the same
+// port) — a hardcoded value silently breaks reachability + health when PORT differs.
 func CoreServerSpec(ds cloudapi.DesiredState, env []string, stackRoot string) dockerx.RunSpec {
+	port := envPort(env, DefaultCorePort)
 	return dockerx.RunSpec{
 		Name:         SvcCore,
 		Service:      SvcCore,
 		Image:        ds.Images.CoreServer,
 		Env:          env,
 		Binds:        []string{filepath.Join(stackRoot, "logs", "core") + ":/app/logs"},
-		ExposedPorts: []string{"3002/tcp"},
+		ExposedPorts: []string{fmt.Sprintf("%d/tcp", port)},
 		Network:      Network,
 		Restart:      true,
 		MemLimit:     384 * mib,
-		Health:       httpHealth(3002),
+		Health:       httpHealth(port),
 	}
 }
 
