@@ -238,6 +238,12 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 			return false, err
 		}
 	}
+	// The core-server / commerce-service containers run as uid 1001 (nestjs) and write to their
+	// bind-mounted /app/logs — hand the host log dir to that uid, else the app boots then crashes with
+	// "EACCES: permission denied, open 'logs/…'". Applies in both DB modes (the app always logs).
+	if err := os.Chown(deploy.CoreLogDir(a.cfg.StackRoot), deploy.CoreServerUID, deploy.CoreServerUID); err != nil {
+		return false, fmt.Errorf("chown core log dir: %w", err)
+	}
 	// MkdirAll creates the pgdata dir owned by the (root) agent, but the postgres container runs as
 	// uid 999 and must be able to write its bind-mounted data dir — hand ownership over, else initdb
 	// fails with "mkdir: cannot create directory '/var/lib/postgresql/data': Permission denied".

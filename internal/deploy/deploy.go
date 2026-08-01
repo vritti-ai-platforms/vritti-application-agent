@@ -140,10 +140,19 @@ const PostgresUID = 999
 // /var/lib/postgresql/data; PGDATA is the `pgdata` subdir inside it).
 func PostgresDataDir(stackRoot string) string { return filepath.Join(stackRoot, "pgdata") }
 
+// CoreServerUID is the uid/gid the core-server (and commerce-service) image runs as — nestjs:nodejs,
+// uid 1001 (see the core-server Dockerfile). Its bind-mounted log dir (logs/core -> /app/logs) must be
+// owned by this uid or the app crashes on startup with "EACCES: permission denied, open 'logs/…'".
+const CoreServerUID = 1001
+
+// CoreLogDir is the host bind-mount dir for the core-server's /app/logs.
+func CoreLogDir(stackRoot string) string { return filepath.Join(stackRoot, "logs", "core") }
+
 // Dirs returns the host bind-mount directories that must exist before containers start.
 func Dirs(stackRoot string, ds cloudapi.DesiredState) []string {
 	dirs := []string{
 		filepath.Join(stackRoot, "logs"),
+		CoreLogDir(stackRoot),
 	}
 	if ds.Mode == cloudapi.ModeManaged {
 		dirs = append(dirs, PostgresDataDir(stackRoot))
