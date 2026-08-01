@@ -238,6 +238,14 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 			return false, err
 		}
 	}
+	// MkdirAll creates the pgdata dir owned by the (root) agent, but the postgres container runs as
+	// uid 999 and must be able to write its bind-mounted data dir — hand ownership over, else initdb
+	// fails with "mkdir: cannot create directory '/var/lib/postgresql/data': Permission denied".
+	if ds.Mode == cloudapi.ModeManaged {
+		if err := os.Chown(deploy.PostgresDataDir(a.cfg.StackRoot), deploy.PostgresUID, deploy.PostgresUID); err != nil {
+			return false, fmt.Errorf("chown postgres data dir: %w", err)
+		}
+	}
 
 	keep := map[string]bool{}
 

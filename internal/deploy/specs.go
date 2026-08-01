@@ -32,7 +32,7 @@ func httpHealth(port int) *dockerx.HealthSpec {
 // (a brief, deliberate restart) — which is exactly the required behavior.
 func PostgresSpec(ds cloudapi.DesiredState, conn DBConn, stackRoot string, archiving bool) dockerx.RunSpec {
 	// The container superuser IS the owner (matches local: POSTGRES_USER=vritti_core_owner).
-	binds := []string{filepath.Join(stackRoot, "pgdata") + ":/var/lib/postgresql/data"}
+	binds := []string{PostgresDataDir(stackRoot) + ":/var/lib/postgresql/data"}
 	var cmd []string
 	if archiving {
 		binds = append(binds,

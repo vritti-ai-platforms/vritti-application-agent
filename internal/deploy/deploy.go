@@ -132,13 +132,21 @@ func ResolveDBConn(ds cloudapi.DesiredState, prov ManagedProvisioning, externalS
 	return ManagedDBConn(prov), nil
 }
 
+// PostgresUID is the uid the official postgres image runs as. Its bind-mounted data dir must be
+// owned by this uid or initdb fails with "Permission denied" on the root-owned mount.
+const PostgresUID = 999
+
+// PostgresDataDir is the host bind-mount dir for the managed Postgres data (mounted at
+// /var/lib/postgresql/data; PGDATA is the `pgdata` subdir inside it).
+func PostgresDataDir(stackRoot string) string { return filepath.Join(stackRoot, "pgdata") }
+
 // Dirs returns the host bind-mount directories that must exist before containers start.
 func Dirs(stackRoot string, ds cloudapi.DesiredState) []string {
 	dirs := []string{
 		filepath.Join(stackRoot, "logs"),
 	}
 	if ds.Mode == cloudapi.ModeManaged {
-		dirs = append(dirs, filepath.Join(stackRoot, "pgdata"))
+		dirs = append(dirs, PostgresDataDir(stackRoot))
 		if ds.AddOns.PgBackRest {
 			dirs = append(dirs,
 				filepath.Join(stackRoot, "backup"),

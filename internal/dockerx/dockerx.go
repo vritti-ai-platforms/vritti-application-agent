@@ -558,6 +558,48 @@ func (c *Client) Exec(ctx context.Context, name string, cmd []string) (int, stri
 	return insp.ExitCode, out.String(), nil
 }
 
+// ExecInput is Exec plus a stdin stream and extra env. It attaches stdin and writes `stdin` to the
+// process before reading its output, so callers can pipe data (e.g. SQL to `psql -f -`) verbatim
+// instead of shell-escaping it into the command — which mangles newlines and risks quoting bugs.
+func (c *Client) ExecInput(ctx context.Context, name string, cmd, env []string, stdin string) (int, string, error) {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil {
+		return -1, "", err
+	}
+	if !ok {
+		return -1, "", fmt.Errorf("container %s not found", name)
+	}
+	created, err := c.api.ContainerExecCreate(ctx, id, container.ExecOptions{
+		Cmd:          cmd,
+		Env:          env,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return -1, "", err
+	}
+	attach, err := c.api.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return -1, "", err
+	}
+	defer attach.Close()
+
+	if stdin != "" {
+		_, _ = io.WriteString(attach.Conn, stdin)
+	}
+	_ = attach.CloseWrite() // EOF so psql stops reading and executes
+
+	var out bytes.Buffer
+	_, _ = stdcopy.StdCopy(&out, &out, attach.Reader)
+
+	insp, err := c.api.ContainerExecInspect(ctx, created.ID)
+	if err != nil {
+		return -1, out.String(), err
+	}
+	return insp.ExitCode, out.String(), nil
+}
+
 // WaitHealthy blocks until the named container reports healthy (or the timeout elapses).
 func (c *Client) WaitHealthy(ctx context.Context, name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

@@ -34,12 +34,13 @@ ALTER SCHEMA gitea OWNER TO %[3]s;
 GRANT CONNECT ON DATABASE %[5]s TO %[3]s;
 `, conn.AppUser, conn.AppPassword, conn.GiteaUser, conn.GiteaPassword, conn.Database)
 
-	cmd := []string{
-		"sh", "-c",
-		fmt.Sprintf("PGPASSWORD=%q psql -v ON_ERROR_STOP=1 -U %s -d %s -c %q",
-			conn.OwnerPassword, conn.OwnerUser, conn.Database, sql),
-	}
-	code, out, err := dx.Exec(ctx, SvcPostgres, cmd)
+	// Feed the SQL to psql over STDIN (`-f -`), not `-c`: embedding a multiline statement in a shell
+	// command with %q renders real newlines as the literal two-char `\n`, which psql then parses as
+	// the meta-command `\n` ("invalid command \nDO"). Stdin carries the bytes verbatim; PGPASSWORD
+	// rides the exec env so no secret is interpolated into a shell string.
+	cmd := []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", conn.OwnerUser, "-d", conn.Database, "-f", "-"}
+	env := []string{"PGPASSWORD=" + conn.OwnerPassword}
+	code, out, err := dx.ExecInput(ctx, SvcPostgres, cmd, env, sql)
 	if err != nil {
 		return fmt.Errorf("db init exec: %w", err)
 	}
