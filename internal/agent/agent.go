@@ -338,7 +338,10 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	// something else fronts core (shared vm1 edge, a customer LB, a tunnel) — no nginx, no certbot.
 	// pgBackRest is NOT a container — archiving lives in the Postgres spec (step 5) and scheduled
 	// backups run via `docker exec` on the backup ticker.
-	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal
+	// Only run the managed edge when there's a domain to serve. edge=external means BYO edge; edge=managed
+	// with zero domains means nothing to front yet — skip nginx/certbot instead of starting an nginx with
+	// an empty `server_name` (which errors) until domains are configured.
+	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal && len(ds.Domains) > 0
 	if a.edgeManaged {
 		certs, err := deploy.EnsureEdge(ctx, a.dx, ds, a.cfg.StackRoot)
 		if err != nil {

@@ -51,8 +51,16 @@ func RenderNginxConf(stackRoot string, domains []cloudapi.DomainRoute) string {
 		hosts = append(hosts, d.Host)
 	}
 
+	// Never emit `server_name ;` (nginx [emerg] invalid number of arguments) — fall back to the `_`
+	// catch-all when there are no hosts. Callers shouldn't reach here with zero domains, but the
+	// renderer stays valid regardless.
+	serverName := strings.Join(hosts, " ")
+	if serverName == "" {
+		serverName = "_"
+	}
+
 	var b strings.Builder
-	b.WriteString("server {\n  listen 80;\n  server_name " + strings.Join(hosts, " ") + ";\n")
+	b.WriteString("server {\n  listen 80;\n  server_name " + serverName + ";\n")
 	b.WriteString("  location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }\n")
 	b.WriteString("  location / { return 301 https://$host$request_uri; }\n}\n\n")
 
