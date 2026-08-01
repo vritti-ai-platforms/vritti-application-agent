@@ -97,11 +97,12 @@ type DesiredState struct {
 	SealedSecrets  map[string]string `json:"sealedSecrets"` // name -> base64 sealed ciphertext (agent decrypts)
 }
 
-// SignedDesiredState wraps DesiredState with cloud's signature over the canonical payload bytes.
+// SignedDesiredState wraps the canonical desired-state JSON with cloud's signature over exactly
+// those bytes. The agent verifies the signature over PayloadB64 and then unmarshals THOSE bytes
+// into a DesiredState — there is no separate unverified payload object to act on by mistake.
 type SignedDesiredState struct {
-	Payload    DesiredState `json:"payload"`
-	PayloadB64 string       `json:"payloadB64"` // canonical JSON the signature is computed over
-	Signature  string       `json:"signature"`  // base64 Ed25519 signature by the deployment key
+	PayloadB64 string `json:"payloadB64"` // canonical desired-state JSON the signature is computed over
+	Signature  string `json:"signature"`  // base64 Ed25519 signature by the deployment key
 }
 
 // EnrollRequest is sent once, presenting the one-time token and the agent's fresh public keys.

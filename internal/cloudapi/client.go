@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -111,9 +112,14 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if c.credential != "" {
 		req.Header.Set("Authorization", "Bearer "+c.credential)
 	}
-	// Sign the body (empty body still signs the empty string) so cloud can verify integrity.
+	// Sign `<unix-seconds>.<body>` so the signature is fresh even for empty-body GETs (a bare body
+	// signature is a static replayable value). Cloud rejects a stale/absent timestamp. The signed
+	// message MUST match the guard exactly: timestamp, a literal '.', then the raw request body.
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	signed := append([]byte(ts+"."), payload...)
 	req.Header.Set("X-Vritti-Agent-Key", c.signer.SigningPublicB64())
-	req.Header.Set("X-Vritti-Signature", c.signer.Sign(payload))
+	req.Header.Set("X-Vritti-Timestamp", ts)
+	req.Header.Set("X-Vritti-Signature", c.signer.Sign(signed))
 
 	resp, err := c.http.Do(req)
 	if err != nil {

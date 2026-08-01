@@ -8,6 +8,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -130,7 +131,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// tick fetches the current desired-state and reconciles once, reporting the outcome.
+// tick fetches the current desired-state, authenticates it, and reconciles once, reporting the outcome.
 func (a *Agent) tick(ctx context.Context) {
 	signed, err := a.cloud.FetchDesiredState(ctx)
 	if err != nil {
@@ -138,23 +139,37 @@ func (a *Agent) tick(ctx context.Context) {
 		return
 	}
 
-	giteaOK, err := a.reconcile(ctx, signed)
+	ds, err := a.verifyDesiredState(signed)
+	if err != nil {
+		a.log.Error("reject desired-state", "err", err)
+		a.report(ctx, 0, "error", err.Error(), false)
+		return
+	}
+
+	giteaOK, err := a.reconcile(ctx, ds)
 	phase, msg := "ready", ""
 	if err != nil {
 		phase, msg = "error", err.Error()
 		a.log.Error("reconcile failed", "err", err)
 	}
-	a.report(ctx, signed.Payload.Generation, phase, msg, giteaOK)
+	a.report(ctx, ds.Generation, phase, msg, giteaOK)
 }
 
-// reconcile drives the stack toward one signed desired-state. Returns whether Gitea is provisioned.
-func (a *Agent) reconcile(ctx context.Context, signed *cloudapi.SignedDesiredState) (bool, error) {
-	// (1) Authenticate the desired-state: it MUST be signed by the deployment key held by cloud.
+// verifyDesiredState authenticates the signed desired-state and returns the payload decoded from
+// EXACTLY the verified bytes — there is no separately-transmitted object to act on by mistake.
+func (a *Agent) verifyDesiredState(signed *cloudapi.SignedDesiredState) (cloudapi.DesiredState, error) {
 	if !agentcrypto.VerifyDeployment(a.enrollment.DeploymentPubKey, []byte(signed.PayloadB64), signed.Signature) {
-		return false, fmt.Errorf("desired-state signature did not verify — refusing to apply")
+		return cloudapi.DesiredState{}, fmt.Errorf("signature did not verify — refusing to apply")
 	}
-	ds := signed.Payload
+	var ds cloudapi.DesiredState
+	if err := json.Unmarshal([]byte(signed.PayloadB64), &ds); err != nil {
+		return cloudapi.DesiredState{}, fmt.Errorf("decode signed desired-state: %w", err)
+	}
+	return ds, nil
+}
 
+// reconcile drives the stack toward one already-verified desired-state. Returns whether Gitea is provisioned.
+func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, error) {
 	// (2) Decrypt the sealed secrets once. Names prefixed `secretProvider.` carry the SECRET half of
 	// the secret-store auth method (client secret, token, jwt, ...) — strip the prefix into
 	// authSecrets. The reserved `external_db` name carries the external-mode DB connection.
