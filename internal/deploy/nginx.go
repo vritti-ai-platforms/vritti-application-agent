@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
@@ -104,7 +105,8 @@ func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredStat
 	}
 
 	// Render (cert-aware) + start nginx so :80 answers the HTTP-01 challenge before certbot runs.
-	if err := writeNginxConf(stackRoot, ds.Domains); err != nil {
+	changed, err := writeNginxConf(stackRoot, ds.Domains)
+	if err != nil {
 		return nil, err
 	}
 	if err := Apply(ctx, dx, NginxSpec(ds, stackRoot)); err != nil {
@@ -112,7 +114,6 @@ func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredStat
 	}
 	time.Sleep(2 * time.Second) // let nginx bind :80 before the first challenge
 
-	obtained := false
 	for _, d := range ds.Domains {
 		if hasCert(stackRoot, d.Host) {
 			continue
@@ -120,14 +121,18 @@ func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredStat
 		if err := obtainCert(ctx, dx, ds, stackRoot, d.Host); err != nil {
 			return nil, err
 		}
-		obtained = true
 	}
 
-	// New certs → re-render so their HTTPS blocks appear, then hot-reload nginx.
-	if obtained {
-		if err := writeNginxConf(stackRoot, ds.Domains); err != nil {
-			return nil, err
-		}
+	// Re-render after cert work so newly-issued HTTPS blocks appear, and reload nginx whenever the
+	// rendered conf changed — from a fresh cert OR a domains/upstream edit pushed from cloud. The conf
+	// is a bind-mounted file (not part of the nginx container spec hash), so a config change never
+	// recreates the container; reloading only on new-cert left plain edits inert (file updated on disk,
+	// running nginx kept the stale conf). Reload on ANY change so cloud-side edits take effect next tick.
+	rerendered, err := writeNginxConf(stackRoot, ds.Domains)
+	if err != nil {
+		return nil, err
+	}
+	if changed || rerendered {
 		if code, out, err := dx.Exec(ctx, SvcNginx, []string{"nginx", "-s", "reload"}); err != nil || code != 0 {
 			return nil, fmt.Errorf("nginx reload (%d): %v %s", code, err, tailOut(out))
 		}
@@ -154,11 +159,18 @@ func RenewCerts(ctx context.Context, dx *dockerx.Client, stackRoot string) error
 	return nil
 }
 
-// writeNginxConf writes the rendered config to conf.d/vritti.conf.
-func writeNginxConf(stackRoot string, domains []cloudapi.DomainRoute) error {
-	return os.WriteFile(
-		filepath.Join(stackRoot, "nginx", "conf.d", "vritti.conf"),
-		[]byte(RenderNginxConf(stackRoot, domains)), 0o644)
+// writeNginxConf writes the rendered config to conf.d/vritti.conf, reporting whether the file
+// content actually changed so the caller can reload nginx only when needed.
+func writeNginxConf(stackRoot string, domains []cloudapi.DomainRoute) (bool, error) {
+	path := filepath.Join(stackRoot, "nginx", "conf.d", "vritti.conf")
+	next := []byte(RenderNginxConf(stackRoot, domains))
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, next) {
+		return false, nil
+	}
+	if err := os.WriteFile(path, next, 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // obtainCert runs certbot (webroot HTTP-01) for one host.
