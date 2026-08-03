@@ -149,6 +149,14 @@ const CoreServerUID = 1001
 // CoreLogDir is the host bind-mount dir for the core-server's /app/logs.
 func CoreLogDir(stackRoot string) string { return filepath.Join(stackRoot, "logs", "core") }
 
+// GiteaUID is the uid/gid the official gitea image runs as (the `git` user). Its bind-mounted data
+// dir (gitea -> /data) must be owned by this uid or gitea crashes reading /data/gitea/conf/app.ini
+// with "permission denied" on the root-owned mount.
+const GiteaUID = 1000
+
+// GiteaDataDir is the host bind-mount dir for gitea's /data.
+func GiteaDataDir(stackRoot string) string { return filepath.Join(stackRoot, "gitea") }
+
 // Dirs returns the host bind-mount directories that must exist before containers start.
 func Dirs(stackRoot string, ds cloudapi.DesiredState) []string {
 	dirs := []string{

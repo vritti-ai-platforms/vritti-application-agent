@@ -185,6 +185,9 @@ func GiteaSpec(ds cloudapi.DesiredState, db DBConn, stackRoot string) dockerx.Ru
 		"GITEA__server__ROOT_URL=" + fmt.Sprintf("https://%s/", domain),
 		"GITEA__server__HTTP_PORT=3000",
 		"GITEA__server__SSH_PORT=2222",
+		// The built-in SSH server must LISTEN on 2222 too — without this it defaults to :22 and
+		// collides with the image's openssh, crashing gitea ("bind: address already in use").
+		"GITEA__server__SSH_LISTEN_PORT=2222",
 		"GITEA__server__START_SSH_SERVER=true",
 		"GITEA__security__INSTALL_LOCK=true",
 		"GITEA__service__DISABLE_REGISTRATION=true",

@@ -334,6 +334,11 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	giteaProvisioned := false
 	giteaURL, giteaToken := "", ""
 	if ds.AddOns.Gitea {
+		// gitea runs as uid 1000 and writes its bind-mounted /data — hand ownership over, else it
+		// crashes reading /data/gitea/conf/app.ini with "permission denied" on the root-owned mount.
+		if err := os.Chown(deploy.GiteaDataDir(a.cfg.StackRoot), deploy.GiteaUID, deploy.GiteaUID); err != nil {
+			return false, fmt.Errorf("chown gitea data dir: %w", err)
+		}
 		giteaSpec := deploy.GiteaSpec(ds, db, a.cfg.StackRoot)
 		if err := deploy.Apply(ctx, a.dx, giteaSpec); err != nil {
 			return false, fmt.Errorf("gitea: %w", err)
