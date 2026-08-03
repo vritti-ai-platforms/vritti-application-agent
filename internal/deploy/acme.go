@@ -41,6 +41,11 @@ const (
 // acmeDNSZone is the delegated challenge zone the bundled acme-dns is authoritative for.
 func acmeDNSZone(baseDomain string) string { return "acme." + baseDomain }
 
+// acmeDNSNameserver is the hostname the challenge zone is delegated to. It is a SIBLING of the zone
+// (under <base>, NOT under acme.<base>), so the parent DNS (Cloudflare et al.) resolves its A record
+// normally — no in-zone glue, which is exactly the setup a self-referential nsname breaks on.
+func acmeDNSNameserver(baseDomain string) string { return "ns." + baseDomain }
+
 // AcmeDNSAPIBase is the in-network URL lego uses to reach the bundled acme-dns HTTP API (the agent
 // must share the stack network so this name resolves).
 func AcmeDNSAPIBase() string { return fmt.Sprintf("http://%s:%d", SvcAcmeDns, acmeDNSAPIPort) }
@@ -83,16 +88,18 @@ func AcmeDnsSpec(stackRoot string) dockerx.RunSpec {
 }
 
 // WriteAcmeDnsConfig renders acme-dns's config for this deployment — authoritative for acme.<base>,
-// self-serving A/NS records on the VM's public IP so the operator can delegate acme.<base> to it.
+// delegated via a SIBLING nameserver ns.<base> (not self-referential), so the parent DNS can resolve
+// the nameserver without in-zone glue. Serves the nameserver's A and the zone's NS record.
 func WriteAcmeDnsConfig(stackRoot, baseDomain, publicIP string) error {
 	zone := acmeDNSZone(baseDomain)
+	ns := acmeDNSNameserver(baseDomain)
 	cfg := fmt.Sprintf(`[general]
 listen = "0.0.0.0:53"
 protocol = "both"
 domain = "%s"
 nsname = "%s"
 nsadmin = "admin.%s"
-records = ["%s. A %s", "%s. NS %s.", "%s. A %s"]
+records = ["%s. A %s", "%s. NS %s."]
 debug = false
 
 [database]
@@ -109,7 +116,7 @@ tls = "none"
 loglevel = "info"
 logtype = "stdout"
 logformat = "json"
-`, zone, zone, baseDomain, zone, publicIP, zone, zone, zone, publicIP, acmeDNSAPIPort)
+`, zone, ns, baseDomain, ns, publicIP, zone, ns, acmeDNSAPIPort)
 
 	cfgDir := filepath.Join(stackRoot, "acme-dns", "config")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
@@ -219,10 +226,11 @@ func IssueWildcard(baseDomain, email, acmeDNSAPIBase, stackRoot, publicIP string
 		var need acmedns.ErrCNAMERequired
 		if errors.As(err, &need) {
 			return &cloudapi.AcmeChallengeDelegation{
-				Name:     need.FQDN,
-				Target:   need.Target,
-				Zone:     acmeDNSZone(baseDomain),
-				ServerIP: publicIP,
+				Name:       need.FQDN,
+				Target:     need.Target,
+				Zone:       acmeDNSZone(baseDomain),
+				Nameserver: acmeDNSNameserver(baseDomain),
+				ServerIP:   publicIP,
 			}, false, nil
 		}
 		return nil, false, fmt.Errorf("obtain wildcard: %w", err)

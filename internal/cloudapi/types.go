@@ -41,19 +41,21 @@ type CertReport struct {
 
 // AcmeChallengeDelegation is the DNS the operator must add so the agent's local acme-dns can answer
 // the wildcard DNS-01 challenge. Surfaced in the heartbeat (→ wizard's DNS-Delegation step) until the
-// cert is issued; nil once issued. TWO records are required:
+// cert is issued; nil once issued. THREE records are required:
 //
-//  1. Zone delegation (one-time, stable): delegate the acme-dns zone to this VM so Let's Encrypt can
-//     reach it —  `<Zone> NS <Zone>.`  and  `<Zone> A <ServerIP>`  (glue). acme-dns is self-named, so
-//     the NS record's name and value are both Zone.
-//  2. Challenge CNAME (per acme-dns account):  `<Name> CNAME <Target>.`
+//  1. Nameserver A:   `<Nameserver> A <ServerIP>` — resolves the acme-dns nameserver. Nameserver is a
+//     SIBLING of the zone (ns.<base>, NOT under acme.<base>), so the parent DNS resolves it with no
+//     in-zone glue — this is what makes it work on Cloudflare (self-referential glue does not).
+//  2. Zone delegation: `<Zone> NS <Nameserver>` — delegates the challenge zone to that nameserver.
+//  3. Challenge CNAME: `<Name> CNAME <Target>` — per acme-dns account; points at the delegated zone.
 //
-// Without (1) the CNAME is a dead end — the zone has no nameserver, so LE can't resolve the TXT.
+// (1)+(2) are one-time/stable; (3)'s target changes if acme-dns re-registers (a data wipe).
 type AcmeChallengeDelegation struct {
-	Name     string `json:"name"`     // CNAME record name: _acme-challenge.<base>
-	Target   string `json:"target"`   // CNAME record value: <id>.acme.<base>
-	Zone     string `json:"zone"`     // NS zone-delegation name AND value: acme.<base>
-	ServerIP string `json:"serverIp"` // glue A for the nameserver — the VM's public IP
+	Name       string `json:"name"`       // CNAME record name: _acme-challenge.<base>
+	Target     string `json:"target"`     // CNAME record value: <id>.acme.<base>
+	Zone       string `json:"zone"`       // NS record name (the delegated zone): acme.<base>
+	Nameserver string `json:"nameserver"` // NS record value AND the A record name: ns.<base>
+	ServerIP   string `json:"serverIp"`   // A record value — the VM's public IP
 }
 
 // WebBundle is one static web artifact (OCI, a gzipped bundle) the managed edge serves off the
