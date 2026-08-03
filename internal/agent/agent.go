@@ -50,8 +50,11 @@ type Agent struct {
 	lastGeneration int64
 	archiving      bool                  // pgBackRest add-on currently enabled (drives the backup ticker)
 	hadFullBackup  bool                  // a full backup has been taken since archiving was enabled
-	edgeManaged    bool                  // agent runs nginx+certbot (drives the cert-renewal ticker)
+	edgeManaged    bool                  // agent runs nginx + the bundled acme-dns wildcard edge
 	certs          []cloudapi.CertReport // last observed managed-edge certs (reported each heartbeat)
+	// acmeDelegation, when set, is the one-time CNAME the operator must add before the wildcard cert
+	// can issue — surfaced in the heartbeat for the wizard's DNS-Delegation step.
+	acmeDelegation *cloudapi.AcmeChallengeDelegation
 }
 
 // New bootstraps the agent: loads config, local keys, machine secrets, and the Docker client.
@@ -96,10 +99,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer backupTicker.Stop()
 	backupTick := 0
 
-	// Cert renewal (only fires when the managed edge is active): certbot renew no-ops until a cert
-	// is within its renewal window, then reloads nginx.
-	certTicker := time.NewTicker(12 * time.Hour)
-	defer certTicker.Stop()
+	// Wildcard cert renewal is handled inside each reconcile (EnsureEdge reissues via lego once the
+	// cert is within its renewal window) — no separate ticker needed.
 
 	a.tick(ctx) // reconcile immediately on boot
 	for {
@@ -119,12 +120,6 @@ func (a *Agent) Run(ctx context.Context) error {
 					a.log.Warn("scheduled backup failed", "type", bt, "err", err)
 				} else {
 					a.log.Info("scheduled backup complete", "type", bt)
-				}
-			}
-		case <-certTicker.C:
-			if a.edgeManaged {
-				if err := deploy.RenewCerts(ctx, a.dx, a.cfg.StackRoot); err != nil {
-					a.log.Warn("cert renewal failed", "err", err)
 				}
 			}
 		}
@@ -344,19 +339,21 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	// something else fronts core (shared vm1 edge, a customer LB, a tunnel) — no nginx, no certbot.
 	// pgBackRest is NOT a container — archiving lives in the Postgres spec (step 5) and scheduled
 	// backups run via `docker exec` on the backup ticker.
-	// Only run the managed edge when there's a domain to serve. edge=external means BYO edge; edge=managed
-	// with zero domains means nothing to front yet — skip nginx/certbot instead of starting an nginx with
-	// an empty `server_name` (which errors) until domains are configured.
-	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal && len(ds.Domains) > 0
+	// Managed edge runs only when there's a base domain to serve. edge=external means BYO edge; the
+	// agent then runs no nginx/acme-dns. Routing (api./git./*.) is derived from the base domain.
+	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal && ds.BaseDomain != ""
 	if a.edgeManaged {
-		certs, err := deploy.EnsureEdge(ctx, a.dx, ds, a.cfg.StackRoot)
+		delegation, certs, err := deploy.EnsureEdge(ctx, a.dx, ds, a.cfg.StackRoot, coreEnvSlice)
 		if err != nil {
 			return giteaProvisioned, err
 		}
 		a.certs = certs
+		a.acmeDelegation = delegation
 		keep[deploy.SvcNginx] = true
+		keep[deploy.SvcAcmeDns] = true
 	} else {
 		a.certs = nil
+		a.acmeDelegation = nil
 	}
 
 	// (12) Prune anything we own that is no longer in the desired set (e.g. a disabled add-on).
@@ -417,6 +414,7 @@ func (a *Agent) report(ctx context.Context, generation int64, phase, msg string,
 		Containers:       containers,
 		GiteaProvisioned: giteaOK,
 		Certificates:     a.certs,
+		AcmeDelegation:   a.acmeDelegation,
 	})
 	if err != nil {
 		a.log.Warn("status report failed", "err", err)

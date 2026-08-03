@@ -19,9 +19,10 @@ const (
 type EdgeMode string
 
 const (
-	// EdgeManaged  — the agent runs nginx and obtains Let's Encrypt certs (certbot) for the domains.
+	// EdgeManaged  — the agent runs nginx and issues a single *.<base> wildcard cert in-process
+	// (lego DNS-01 via the bundled acme-dns). Routing is derived from BaseDomain, not operator-mapped.
 	EdgeManaged EdgeMode = "managed"
-	// EdgeExternal — something else fronts core; the agent runs no nginx and no certbot.
+	// EdgeExternal — something else fronts core; the agent runs no nginx and issues no certs.
 	EdgeExternal EdgeMode = "external"
 )
 
@@ -36,6 +37,23 @@ type CertReport struct {
 	Host     string `json:"host"`
 	NotAfter string `json:"notAfter"` // RFC3339 expiry
 	IssuedAt string `json:"issuedAt"` // RFC3339 not-before
+}
+
+// AcmeChallengeDelegation is the ONE-TIME CNAME the operator must add so the agent's local acme-dns
+// can answer the wildcard DNS-01 challenge. Surfaced in the heartbeat (→ wizard's DNS-Delegation step)
+// until it's live; nil once the wildcard is issuing/issued. Add `<Name> CNAME <Target>` in any DNS.
+type AcmeChallengeDelegation struct {
+	Name   string `json:"name"`   // e.g. _acme-challenge.apw1.vrittiai.com
+	Target string `json:"target"` // e.g. <id>.acme.apw1.vrittiai.com
+}
+
+// WebBundle is one static web artifact (OCI, a gzipped bundle) the managed edge serves off the
+// wildcard origin. Path "" is the host SPA (core-web) at web root; a non-empty Path (e.g. "commerce")
+// is a module-federation remote extracted to that subdir, so core-web loads it same-origin at
+// /<path>/mf-manifest.json. Cloud picks the set per the deployment's entitled features.
+type WebBundle struct {
+	Artifact string `json:"artifact"` // e.g. ghcr.io/vritti-ai-platforms/core-web:latest-main
+	Path     string `json:"path"`     // "" = web root; "commerce" = /commerce subdir
 }
 
 // Images is the set of resolved, pinned image references for a deployment's stack.
@@ -81,20 +99,21 @@ type SecretProvider struct {
 // DesiredState is what cloud wants running; the agent reconciles toward it. Cloud SIGNS this
 // with the deployment private key and the agent verifies with the deployment public key.
 type DesiredState struct {
-	Generation    int64             `json:"generation"` // monotonic; agent skips reconcile if unchanged
-	DeploymentID  string            `json:"deploymentId"`
-	Version       string            `json:"version"` // pinned catalog/app version reference
-	Mode          DBMode            `json:"mode"`
-	Edge          EdgeMode          `json:"edge"`        // managed = agent runs nginx+certbot; external = BYO edge
-	BaseDomain    string            `json:"baseDomain"`  // e.g. dev.vrittiai.com / apw1.vrittiai.com
-	Domains       []DomainRoute     `json:"domains"`     // hosts the managed edge serves + certs (ignored when Edge=external)
-	AcmeEmail     string            `json:"acmeEmail"`   // Let's Encrypt registration email (cloud-owned)
-	AcmeStaging   bool              `json:"acmeStaging"` // use the LE staging CA (avoids rate limits while testing)
-	Images         Images          `json:"images"`
-	AddOns         AddOns          `json:"addOns"`
-	SecretProvider *SecretProvider `json:"secretProvider"` // per-deployment secret store (cloud-provided); nil = none
-	Config         map[string]string `json:"config"`        // plaintext non-secret config (R2 bucket names, tunables)
-	SealedSecrets  map[string]string `json:"sealedSecrets"` // name -> base64 sealed ciphertext (agent decrypts)
+	Generation     int64             `json:"generation"` // monotonic; agent skips reconcile if unchanged
+	DeploymentID   string            `json:"deploymentId"`
+	Version        string            `json:"version"` // pinned catalog/app version reference
+	Mode           DBMode            `json:"mode"`
+	Edge           EdgeMode          `json:"edge"`        // managed = agent runs nginx+certbot; external = BYO edge
+	BaseDomain     string            `json:"baseDomain"`  // e.g. dev.vrittiai.com / apw1.vrittiai.com
+	Domains        []DomainRoute     `json:"domains"`     // hosts the managed edge serves + certs (ignored when Edge=external)
+	AcmeEmail      string            `json:"acmeEmail"`   // Let's Encrypt registration email (cloud-owned)
+	AcmeStaging    bool              `json:"acmeStaging"` // use the LE staging CA (avoids rate limits while testing)
+	Images         Images            `json:"images"`
+	WebBundles     []WebBundle       `json:"webBundles"` // static web artifacts the managed edge serves off *.<base>
+	AddOns         AddOns            `json:"addOns"`
+	SecretProvider *SecretProvider   `json:"secretProvider"` // per-deployment secret store (cloud-provided); nil = none
+	Config         map[string]string `json:"config"`         // plaintext non-secret config (R2 bucket names, tunables)
+	SealedSecrets  map[string]string `json:"sealedSecrets"`  // name -> base64 sealed ciphertext (agent decrypts)
 }
 
 // SignedDesiredState wraps the canonical desired-state JSON with cloud's signature over exactly
@@ -150,4 +169,7 @@ type StatusReport struct {
 	GiteaProvisioned bool `json:"giteaProvisioned"`
 	// Certificates report each managed-edge cert's expiry so cloud can track/alert (system of record).
 	Certificates []CertReport `json:"certificates"`
+	// AcmeDelegation, when non-nil, is the one-time CNAME the operator must add before the wildcard
+	// cert can be issued (surfaced in the wizard's DNS-Delegation step).
+	AcmeDelegation *AcmeChallengeDelegation `json:"acmeDelegation,omitempty"`
 }

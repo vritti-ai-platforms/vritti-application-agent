@@ -227,6 +227,7 @@ func NginxSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
 			filepath.Join(stackRoot, "nginx", "conf.d") + ":/etc/nginx/conf.d:ro",
 			filepath.Join(stackRoot, leDir) + ":/etc/letsencrypt:ro",
 			filepath.Join(stackRoot, leDir, "www") + ":/var/www/letsencrypt:ro",
+			webRoot(stackRoot) + ":/var/www/core-web:ro",
 			filepath.Join(stackRoot, "logs", "nginx") + ":/var/log/nginx",
 		},
 		Ports:    map[string]string{"80/tcp": "80", "443/tcp": "443"},

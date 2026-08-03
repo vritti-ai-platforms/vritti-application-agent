@@ -15,24 +15,21 @@ import (
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
 )
 
-// certbotImage obtains + renews Let's Encrypt certs (HTTP-01 webroot). leDir is the on-host certbot
-// config dir (certs under live/<host>/), shared read-only into nginx; leDir/www is the ACME webroot
-// shared between certbot (writes challenges) and nginx (serves them).
-const (
-	certbotImage = "certbot/certbot:latest"
-	leDir        = "letsencrypt"
-)
+// leDir is the on-host Let's Encrypt dir: the wildcard cert under live/<base>/, plus the acme-dns
+// account (acmedns.json) and the ACME account key. Shared read-only into nginx.
+const leDir = "letsencrypt"
 
-// EdgeDirs are the host dirs the managed edge needs before nginx/certbot run.
+// EdgeDirs are the host dirs the managed edge needs before nginx runs.
 func EdgeDirs(stackRoot string) []string {
 	return []string{
 		filepath.Join(stackRoot, "nginx", "conf.d"),
-		filepath.Join(stackRoot, leDir, "www"),
 		filepath.Join(stackRoot, "logs", "nginx"),
+		filepath.Join(stackRoot, leDir),
+		webRoot(stackRoot),
 	}
 }
 
-// certLive is the host path to a domain's live cert directory.
+// certLive is the host path to the wildcard cert's live directory (keyed by the base domain).
 func certLive(stackRoot, host string) string {
 	return filepath.Join(stackRoot, leDir, "live", host)
 }
@@ -43,127 +40,115 @@ func hasCert(stackRoot, host string) bool {
 	return err == nil
 }
 
-// RenderNginxConf builds the config: one HTTP server (ACME webroot + redirect to HTTPS) and one
-// HTTPS server per domain that ALREADY has a cert, proxying to its upstream. It is cert-aware so it
-// is valid both before first issuance (HTTP only, serving the challenge) and after (HTTPS appears).
-func RenderNginxConf(stackRoot string, domains []cloudapi.DomainRoute) string {
-	hosts := make([]string, 0, len(domains))
-	for _, d := range domains {
-		hosts = append(hosts, d.Host)
+// DerivedRoutes computes the proxy routes from the base domain — routing is DERIVED, not
+// operator-configured. api.<base> → core-server on its real PORT; git.<base> → gitea when the add-on
+// is on. The tenant/core-web wildcard (*.<base>) is served statically, handled in RenderNginxConf.
+func DerivedRoutes(baseDomain string, corePort int, gitea bool) []cloudapi.DomainRoute {
+	if baseDomain == "" {
+		return nil
 	}
-
-	// Never emit `server_name ;` (nginx [emerg] invalid number of arguments) — fall back to the `_`
-	// catch-all when there are no hosts. Callers shouldn't reach here with zero domains, but the
-	// renderer stays valid regardless.
-	serverName := strings.Join(hosts, " ")
-	if serverName == "" {
-		serverName = "_"
+	routes := []cloudapi.DomainRoute{
+		{Host: "api." + baseDomain, Upstream: fmt.Sprintf("%s:%d", SvcCore, corePort)},
 	}
+	if gitea {
+		routes = append(routes, cloudapi.DomainRoute{Host: "git." + baseDomain, Upstream: SvcGitea + ":3000"})
+	}
+	return routes
+}
 
+// RenderNginxConf builds the edge config off the single *.<base> wildcard cert: an HTTP→HTTPS
+// redirect, a proxy block per derived route (api./git.), and the wildcard static block serving
+// core-web/MF bundles for every other (tenant) subdomain. Cert-aware: before the wildcard is issued
+// it emits HTTP-only (nginx stays valid); the HTTPS blocks appear once the cert exists.
+func RenderNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute) string {
 	var b strings.Builder
-	b.WriteString("server {\n  listen 80;\n  server_name " + serverName + ";\n")
-	b.WriteString("  location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }\n")
-	b.WriteString("  location / { return 301 https://$host$request_uri; }\n}\n\n")
+	b.WriteString("server {\n  listen 80;\n  server_name _;\n  location / { return 301 https://$host$request_uri; }\n}\n\n")
 
-	for _, d := range domains {
-		if !hasCert(stackRoot, d.Host) {
-			continue
-		}
-		b.WriteString("server {\n  listen 443 ssl;\n  http2 on;\n  server_name " + d.Host + ";\n")
-		b.WriteString("  ssl_certificate /etc/letsencrypt/live/" + d.Host + "/fullchain.pem;\n")
-		b.WriteString("  ssl_certificate_key /etc/letsencrypt/live/" + d.Host + "/privkey.pem;\n")
-		b.WriteString("  ssl_protocols TLSv1.2 TLSv1.3;\n  client_max_body_size 25m;\n")
-		b.WriteString("  location / {\n")
-		b.WriteString("    proxy_pass http://" + d.Upstream + ";\n")
-		b.WriteString("    proxy_http_version 1.1;\n")
-		b.WriteString("    proxy_set_header Host $host;\n")
-		b.WriteString("    proxy_set_header X-Real-IP $remote_addr;\n")
-		b.WriteString("    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
-		b.WriteString("    proxy_set_header X-Forwarded-Proto $scheme;\n")
-		b.WriteString("    proxy_set_header Upgrade $http_upgrade;\n")
-		b.WriteString("    proxy_set_header Connection \"upgrade\";\n")
-		b.WriteString("  }\n}\n\n")
+	if baseDomain == "" || !hasCert(stackRoot, baseDomain) {
+		return b.String() // wildcard not issued yet → HTTP only
 	}
+	cert := "/etc/letsencrypt/live/" + baseDomain
+	tls := "  ssl_certificate " + cert + "/fullchain.pem;\n  ssl_certificate_key " + cert + "/privkey.pem;\n" +
+		"  ssl_protocols TLSv1.2 TLSv1.3;\n  client_max_body_size 25m;\n"
+
+	// Specific proxy hosts (api./git.) — nginx matches these before the *.<base> catch-all.
+	for _, r := range routes {
+		b.WriteString("server {\n  listen 443 ssl;\n  http2 on;\n  server_name " + r.Host + ";\n" + tls)
+		b.WriteString("  location / {\n    proxy_pass http://" + r.Upstream + ";\n    proxy_http_version 1.1;\n")
+		b.WriteString("    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n")
+		b.WriteString("    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $scheme;\n")
+		b.WriteString("    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n  }\n}\n\n")
+	}
+
+	// Wildcard catch-all: tenant subdomains → the static core-web SPA (populated by the bundle sync).
+	b.WriteString("server {\n  listen 443 ssl;\n  http2 on;\n  server_name *." + baseDomain + ";\n" + tls)
+	b.WriteString("  root /var/www/core-web;\n  location / { try_files $uri /index.html; }\n}\n\n")
 	return b.String()
 }
 
-// EnsureEdge brings up the managed nginx edge and returns the current cert reports: render conf,
-// ensure nginx (serving :80 for the ACME challenge), obtain any missing certs, re-render + reload,
-// then read each cert's validity window. The caller marks nginx as kept.
-func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string) ([]cloudapi.CertReport, error) {
+// EnsureEdge brings up the managed edge: the bundled acme-dns, the single *.<base> wildcard via lego
+// (DNS-01), and nginx. Returns any pending one-time DNS delegation (the operator's CNAME, surfaced in
+// the wizard) and the wildcard cert report. No certbot, no per-host certs.
+func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string) (*cloudapi.AcmeChallengeDelegation, []cloudapi.CertReport, error) {
+	routes := DerivedRoutes(ds.BaseDomain, envPort(coreEnv, DefaultCorePort), ds.AddOns.Gitea)
 	for _, dir := range EdgeDirs(stackRoot) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	// nginx workers (user `nginx`, non-root) serve the ACME webroot, so it must be world-traversable.
-	// MkdirAll leaves it 0750/root and the worker fails with open() "(13: Permission denied)", which
-	// Let's Encrypt sees as a 403 on the HTTP-01 challenge. certbot writes the challenge dir + files
-	// world-readable itself, so 0755 on the webroot is all that's needed.
-	if err := os.Chmod(filepath.Join(stackRoot, leDir, "www"), 0o755); err != nil {
-		return nil, err
+
+	// Bundled acme-dns — authoritative for acme.<base>, so lego can prove control for the wildcard.
+	if ip, err := PublicIP(ctx); err == nil {
+		if err := WriteAcmeDnsConfig(stackRoot, ds.BaseDomain, ip); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := Apply(ctx, dx, AcmeDnsSpec(stackRoot)); err != nil {
+		return nil, nil, fmt.Errorf("acme-dns: %w", err)
 	}
 
-	// Render (cert-aware) + start nginx so :80 answers the HTTP-01 challenge before certbot runs.
-	changed, err := writeNginxConf(stackRoot, ds.Domains)
+	// Sync the static web bundles (core-web host + entitled MF remotes) into the wildcard web root.
+	// First provision must surface a pull failure so a bad artifact ref is visible; once the host
+	// bundle is in place we stay best-effort, so a transient registry blip can't flip a healthy
+	// deployment to error (nginx serves the on-disk copy and the next tick retries).
+	if _, err := SyncWebBundles(ctx, ds.WebBundles, stackRoot); err != nil {
+		if !hostBundleReady(stackRoot) {
+			return nil, nil, fmt.Errorf("web bundles: %w", err)
+		}
+	}
+
+	// Issue/renew the single wildcard. On first run this returns the one-time CNAME to surface.
+	var delegation *cloudapi.AcmeChallengeDelegation
+	if certNeedsIssue(stackRoot, ds.BaseDomain) {
+		del, issued, err := IssueWildcard(ds.BaseDomain, ds.AcmeEmail, AcmeDNSAPIBase(), stackRoot, ds.AcmeStaging)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !issued {
+			delegation = del // waiting on the operator's CNAME before LE can validate
+		}
+	}
+
+	// Render (wildcard cert-aware) + ensure nginx, reload on any change (conf is a bind-mount, so a
+	// change never recreates the container — reload applies it).
+	changed, err := writeNginxConf(stackRoot, ds.BaseDomain, routes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := Apply(ctx, dx, NginxSpec(ds, stackRoot)); err != nil {
-		return nil, fmt.Errorf("nginx: %w", err)
+		return nil, nil, fmt.Errorf("nginx: %w", err)
 	}
-	time.Sleep(2 * time.Second) // let nginx bind :80 before the first challenge
-
-	for _, d := range ds.Domains {
-		if hasCert(stackRoot, d.Host) {
-			continue
-		}
-		if err := obtainCert(ctx, dx, ds, stackRoot, d.Host); err != nil {
-			return nil, err
-		}
+	if changed {
+		_, _, _ = dx.Exec(ctx, SvcNginx, []string{"nginx", "-s", "reload"})
 	}
 
-	// Re-render after cert work so newly-issued HTTPS blocks appear, and reload nginx whenever the
-	// rendered conf changed — from a fresh cert OR a domains/upstream edit pushed from cloud. The conf
-	// is a bind-mounted file (not part of the nginx container spec hash), so a config change never
-	// recreates the container; reloading only on new-cert left plain edits inert (file updated on disk,
-	// running nginx kept the stale conf). Reload on ANY change so cloud-side edits take effect next tick.
-	rerendered, err := writeNginxConf(stackRoot, ds.Domains)
-	if err != nil {
-		return nil, err
-	}
-	if changed || rerendered {
-		if code, out, err := dx.Exec(ctx, SvcNginx, []string{"nginx", "-s", "reload"}); err != nil || code != 0 {
-			return nil, fmt.Errorf("nginx reload (%d): %v %s", code, err, tailOut(out))
-		}
-	}
-
-	return readCerts(stackRoot, ds.Domains), nil
+	return delegation, readCerts(stackRoot, []cloudapi.DomainRoute{{Host: ds.BaseDomain}}), nil
 }
 
-// RenewCerts renews any near-expiry certs (idempotent; certbot no-ops when nothing is due) and
-// reloads nginx. Driven by the agent's renewal ticker.
-func RenewCerts(ctx context.Context, dx *dockerx.Client, stackRoot string) error {
-	spec := certbotSpec(stackRoot, "certbot-renew", []string{
-		"renew", "--webroot", "-w", "/var/www/letsencrypt",
-		"--config-dir", "/etc/letsencrypt", "--work-dir", "/var/lib/letsencrypt", "--logs-dir", "/var/log/letsencrypt", "-n",
-	})
-	code, out, err := dx.RunToCompletion(ctx, spec)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("certbot renew exited %d: %s", code, tailOut(out))
-	}
-	_, _, _ = dx.Exec(ctx, SvcNginx, []string{"nginx", "-s", "reload"})
-	return nil
-}
-
-// writeNginxConf writes the rendered config to conf.d/vritti.conf, reporting whether the file
-// content actually changed so the caller can reload nginx only when needed.
-func writeNginxConf(stackRoot string, domains []cloudapi.DomainRoute) (bool, error) {
+// writeNginxConf writes the rendered config to conf.d/vritti.conf, reporting whether the content changed.
+func writeNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute) (bool, error) {
 	path := filepath.Join(stackRoot, "nginx", "conf.d", "vritti.conf")
-	next := []byte(RenderNginxConf(stackRoot, domains))
+	next := []byte(RenderNginxConf(stackRoot, baseDomain, routes))
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, next) {
 		return false, nil
 	}
@@ -173,48 +158,7 @@ func writeNginxConf(stackRoot string, domains []cloudapi.DomainRoute) (bool, err
 	return true, nil
 }
 
-// obtainCert runs certbot (webroot HTTP-01) for one host.
-func obtainCert(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot, host string) error {
-	args := []string{
-		"certonly", "--webroot", "-w", "/var/www/letsencrypt",
-		"--email", ds.AcmeEmail, "--agree-tos", "--no-eff-email", "-n",
-		"--config-dir", "/etc/letsencrypt", "--work-dir", "/var/lib/letsencrypt", "--logs-dir", "/var/log/letsencrypt",
-		"-d", host,
-	}
-	if ds.AcmeStaging {
-		args = append(args, "--staging")
-	}
-	name := "certbot-" + strings.ReplaceAll(host, ".", "-")
-	spec := certbotSpec(stackRoot, name, args)
-	if err := dx.PullImage(ctx, spec.Image); err != nil {
-		return err
-	}
-	code, out, err := dx.RunToCompletion(ctx, spec)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("certbot %s exited %d: %s", host, code, tailOut(out))
-	}
-	return nil
-}
-
-// certbotSpec is a one-shot certbot container sharing the cert dir + ACME webroot with nginx.
-func certbotSpec(stackRoot, name string, args []string) dockerx.RunSpec {
-	return dockerx.RunSpec{
-		Name:    name,
-		Service: "certbot",
-		Image:   certbotImage,
-		Cmd:     args,
-		Binds: []string{
-			filepath.Join(stackRoot, leDir) + ":/etc/letsencrypt",
-			filepath.Join(stackRoot, leDir, "www") + ":/var/www/letsencrypt",
-		},
-		Network: Network,
-	}
-}
-
-// readCerts reads each domain's live fullchain and reports its validity window.
+// readCerts reads each cert's live fullchain and reports its validity window.
 func readCerts(stackRoot string, domains []cloudapi.DomainRoute) []cloudapi.CertReport {
 	reports := make([]cloudapi.CertReport, 0, len(domains))
 	for _, d := range domains {
@@ -242,12 +186,4 @@ func parseCert(path string) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("no PEM certificate in %s", path)
 	}
 	return x509.ParseCertificate(block.Bytes)
-}
-
-// tailOut trims command output to a readable tail for error messages.
-func tailOut(s string) string {
-	if len(s) > 1500 {
-		return "…" + s[len(s)-1500:]
-	}
-	return s
 }

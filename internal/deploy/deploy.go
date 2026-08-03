@@ -23,6 +23,7 @@ const (
 	SvcCommerce = "commerce-service"
 	SvcGitea    = "gitea"
 	SvcNginx    = "nginx"
+	SvcAcmeDns  = "acme-dns" // bundled DNS-01 responder for the managed-edge wildcard cert
 )
 
 // DBConn is the resolved database connection for the current mode.

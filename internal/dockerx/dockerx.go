@@ -131,19 +131,39 @@ func (c *Client) PullImage(ctx context.Context, ref string) error {
 // generic: the agent reuses whatever registry the host is logged in to, with nothing registry- or
 // operator-specific compiled in.
 func resolveRegistryAuth(ref string) string {
-	host := registryHost(ref)
+	host, user, pass := RegistryCredential(ref)
+	if user == "" && pass == "" {
+		return ""
+	}
+	enc, err := registry.EncodeAuthConfig(registry.AuthConfig{
+		Username:      user,
+		Password:      pass,
+		ServerAddress: host,
+	})
+	if err != nil {
+		return ""
+	}
+	return enc
+}
+
+// RegistryCredential resolves the (host, username, password) for ref's registry from the host Docker
+// config (DOCKER_CONFIG or ~/.docker/config.json). user/pass are "" when the host isn't logged in to
+// that registry (anonymous). Shared by image pulls and the oras web-bundle pull so both reuse the one
+// credential source the operator's `docker login` already established.
+func RegistryCredential(ref string) (host, user, pass string) {
+	host = registryHost(ref)
 
 	cfgDir := os.Getenv("DOCKER_CONFIG")
 	if cfgDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return ""
+			return host, "", ""
 		}
 		cfgDir = filepath.Join(home, ".docker")
 	}
 	raw, err := os.ReadFile(filepath.Join(cfgDir, "config.json"))
 	if err != nil {
-		return ""
+		return host, "", ""
 	}
 
 	var cfg struct {
@@ -154,14 +174,14 @@ func resolveRegistryAuth(ref string) string {
 		} `json:"auths"`
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return ""
+		return host, "", ""
 	}
 
 	entry, ok := cfg.Auths[host]
 	if !ok {
-		return ""
+		return host, "", ""
 	}
-	user, pass := entry.Username, entry.Password
+	user, pass = entry.Username, entry.Password
 	if entry.Auth != "" {
 		if dec, err := base64.StdEncoding.DecodeString(entry.Auth); err == nil {
 			if i := strings.IndexByte(string(dec), ':'); i >= 0 {
@@ -169,19 +189,7 @@ func resolveRegistryAuth(ref string) string {
 			}
 		}
 	}
-	if user == "" && pass == "" {
-		return ""
-	}
-
-	enc, err := registry.EncodeAuthConfig(registry.AuthConfig{
-		Username:      user,
-		Password:      pass,
-		ServerAddress: host,
-	})
-	if err != nil {
-		return ""
-	}
-	return enc
+	return host, user, pass
 }
 
 // registryHost extracts the registry hostname from an image reference, defaulting to Docker Hub.
