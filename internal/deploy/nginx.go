@@ -119,7 +119,11 @@ func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.Desired
 	// Issue/renew the single wildcard. On first run this returns the one-time delegation to surface.
 	var delegation *cloudapi.AcmeChallengeDelegation
 	if certNeedsIssue(stackRoot, ds.BaseDomain) {
-		del, issued, err := IssueWildcard(ds.BaseDomain, ds.AcmeEmail, AcmeDNSAPIBase(), stackRoot, publicIP, ds.AcmeStaging)
+		acmeEmail := ""
+		if ds.Components.Edge != nil {
+			acmeEmail = ds.Components.Edge.AcmeEmail
+		}
+		del, issued, err := IssueWildcard(ds.BaseDomain, acmeEmail, AcmeDNSAPIBase(), stackRoot, publicIP, ds.AcmeStaging)
 		if err != nil {
 			return nil, false, nil, err
 		}
@@ -134,7 +138,8 @@ func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.Desired
 // syncs the static web bundles, and (re)starts nginx. Run AFTER the stack is provisioned so upstreams
 // resolve and AFTER the wildcard exists (gated by the caller), so nginx comes up serving HTTPS.
 func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string) ([]cloudapi.CertReport, error) {
-	routes := DerivedRoutes(ds.BaseDomain, envPort(coreEnv, DefaultCorePort), ds.AddOns.Gitea)
+	giteaEnabled := ds.Components.Gitea != nil && ds.Components.Gitea.Enabled
+	routes := DerivedRoutes(ds.BaseDomain, envPort(coreEnv, DefaultCorePort), giteaEnabled)
 
 	// Sync the static web bundles (core-web host + entitled MF remotes) into the wildcard web root.
 	// First provision must surface a pull failure so a bad artifact ref is visible; once the host

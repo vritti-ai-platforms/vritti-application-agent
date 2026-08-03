@@ -127,7 +127,7 @@ func ExternalDBConn(decrypted []byte) (DBConn, error) {
 // ResolveDBConn returns the DBConn for the deployment's mode. Managed mode uses the provisioning
 // creds from Infisical's `/agent` folder; external mode parses the already-decrypted sealed secret.
 func ResolveDBConn(ds cloudapi.DesiredState, prov ManagedProvisioning, externalSecret []byte) (DBConn, error) {
-	if ds.Mode == cloudapi.ModeExternal {
+	if db := ds.Components.Database; db != nil && db.Mode == cloudapi.ModeExternal {
 		return ExternalDBConn(externalSecret)
 	}
 	return ManagedDBConn(prov), nil
@@ -170,16 +170,18 @@ func Dirs(stackRoot string, ds cloudapi.DesiredState) []string {
 		filepath.Join(stackRoot, "logs"),
 		CoreLogDir(stackRoot),
 	}
-	if ds.Mode == cloudapi.ModeManaged {
+	db := ds.Components.Database
+	// Managed = anything but an explicit external DB (the agent runs its own Postgres by default).
+	if db == nil || db.Mode == cloudapi.ModeManaged {
 		dirs = append(dirs, PostgresDataDir(stackRoot))
-		if ds.AddOns.PgBackRest {
+		if db != nil && db.Backup != nil {
 			dirs = append(dirs,
 				filepath.Join(stackRoot, "backup"),
 				filepath.Join(stackRoot, "pgbackrest"),
 			)
 		}
 	}
-	if ds.AddOns.Gitea {
+	if g := ds.Components.Gitea; g != nil && g.Enabled {
 		dirs = append(dirs, filepath.Join(stackRoot, "gitea"))
 	}
 	return dirs

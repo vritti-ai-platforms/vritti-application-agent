@@ -24,10 +24,10 @@ func pgbackrestExec(args string) []string {
 // NOT core-server's media bucket) — an encrypted repo2 on any S3-compatible store. The cipher
 // passphrase is a machine secret (never leaves the VM). pgUser is the DB superuser pgBackRest uses.
 func RenderPgBackRestConf(ds cloudapi.DesiredState, m *secrets.Machine, resolved map[string]string, pgUser string) string {
-	// Retention (full backups kept) comes from cloud in the desired-state; guard the unset/legacy 0.
-	retention := ds.AddOns.BackupRetention
-	if retention < 1 {
-		retention = 4
+	// Retention (full backups kept) comes from cloud in the database component; guard the unset/legacy 0.
+	retention := 4
+	if db := ds.Components.Database; db != nil && db.Backup != nil && db.Backup.Retention >= 1 {
+		retention = db.Backup.Retention
 	}
 
 	var b strings.Builder

@@ -78,14 +78,6 @@ type Images struct {
 	Nginx           string `json:"nginx"`
 }
 
-// AddOns are the truly optional stack features toggled per deployment. nginx is NOT here — it is a
-// core service governed by DesiredState.Edge.
-type AddOns struct {
-	PgBackRest      bool `json:"pgBackRest"`      // premium; only meaningful with ModeManaged
-	BackupRetention int  `json:"backupRetention"` // pgBackRest full backups kept (repo*-retention-full); <1 falls back to 4
-	Gitea           bool `json:"gitea"`
-}
-
 // SecretProviderAuth selects how the agent authenticates to the secret store. Non-secret params
 // (identity id, client id, token/key file paths, region, resource, username, ...) live in Params;
 // the SECRET half of each method (client secret, token, jwt, password, OCI private key/passphrase,
@@ -108,24 +100,59 @@ type SecretProvider struct {
 	Auth      SecretProviderAuth `json:"auth"`
 }
 
+// CoreComponent is the core stack the agent runs (core-server / commerce-service / nats / redis).
+type CoreComponent struct {
+	Enabled bool `json:"enabled"`
+}
+
+// DatabaseBackup is the pgBackRest config for a managed database; presence = the backup add-on is on.
+type DatabaseBackup struct {
+	Retention int `json:"retention"` // full backups kept (repo*-retention-full); <1 falls back to 4
+}
+
+// DatabaseComponent selects how Postgres is provided. managed = the agent runs its own containerized
+// Postgres; external = the operator brings their own DB (connection arrives as a sealed secret).
+type DatabaseComponent struct {
+	Mode   DBMode          `json:"mode"`
+	Backup *DatabaseBackup `json:"backup,omitempty"` // pgBackRest config — only valid when mode=managed
+}
+
+// EdgeComponent selects how the HTTP edge (nginx + TLS) is provided. managed = the agent runs nginx
+// and issues the *.<base> wildcard; external = something else fronts core (no nginx, no certs).
+type EdgeComponent struct {
+	Mode      EdgeMode `json:"mode"`
+	AcmeEmail string   `json:"acmeEmail,omitempty"` // Let's Encrypt registration email (required when managed)
+}
+
+// GiteaComponent is the post-setup opt-in Gitea add-on.
+type GiteaComponent struct {
+	Enabled bool `json:"enabled"`
+}
+
+// Components is the resolved stack composition the agent reconciles toward. Absent components are nil:
+// core is always present; database/edge/gitea/secretStore are nil when the deployment omits them.
+type Components struct {
+	Core        CoreComponent      `json:"core"`
+	Database    *DatabaseComponent `json:"database"`
+	Edge        *EdgeComponent     `json:"edge"`
+	Gitea       *GiteaComponent    `json:"gitea"`
+	SecretStore *SecretProvider    `json:"secretStore"` // per-deployment secret store (cloud-provided); nil = none
+}
+
 // DesiredState is what cloud wants running; the agent reconciles toward it. Cloud SIGNS this
 // with the deployment private key and the agent verifies with the deployment public key.
 type DesiredState struct {
-	Generation     int64             `json:"generation"` // monotonic; agent skips reconcile if unchanged
-	DeploymentID   string            `json:"deploymentId"`
-	Version        string            `json:"version"` // pinned catalog/app version reference
-	Mode           DBMode            `json:"mode"`
-	Edge           EdgeMode          `json:"edge"`        // managed = agent runs nginx+certbot; external = BYO edge
-	BaseDomain     string            `json:"baseDomain"`  // e.g. dev.vrittiai.com / apw1.vrittiai.com
-	Domains        []DomainRoute     `json:"domains"`     // hosts the managed edge serves + certs (ignored when Edge=external)
-	AcmeEmail      string            `json:"acmeEmail"`   // Let's Encrypt registration email (cloud-owned)
-	AcmeStaging    bool              `json:"acmeStaging"` // use the LE staging CA (avoids rate limits while testing)
-	Images         Images            `json:"images"`
-	WebBundles     []WebBundle       `json:"webBundles"` // static web artifacts the managed edge serves off *.<base>
-	AddOns         AddOns            `json:"addOns"`
-	SecretProvider *SecretProvider   `json:"secretProvider"` // per-deployment secret store (cloud-provided); nil = none
-	Config         map[string]string `json:"config"`         // plaintext non-secret config (R2 bucket names, tunables)
-	SealedSecrets  map[string]string `json:"sealedSecrets"`  // name -> base64 sealed ciphertext (agent decrypts)
+	Generation    int64             `json:"generation"` // monotonic; agent skips reconcile if unchanged
+	DeploymentID  string            `json:"deploymentId"`
+	Version       string            `json:"version"`     // pinned catalog/app version reference
+	SpecVersion   int               `json:"specVersion"` // spec schema version
+	BaseDomain    string            `json:"baseDomain"`  // e.g. dev.vrittiai.com / apw1.vrittiai.com
+	Components    Components        `json:"components"`  // the resolved stack composition to reconcile toward
+	AcmeStaging   bool              `json:"acmeStaging"` // use the LE staging CA (avoids rate limits while testing)
+	Images        Images            `json:"images"`
+	WebBundles    []WebBundle       `json:"webBundles"`    // static web artifacts the managed edge serves off *.<base>
+	Config        map[string]string `json:"config"`        // plaintext non-secret config (R2 bucket names, tunables)
+	SealedSecrets map[string]string `json:"sealedSecrets"` // name -> base64 sealed ciphertext (agent decrypts)
 }
 
 // SignedDesiredState wraps the canonical desired-state JSON with cloud's signature over exactly
@@ -169,8 +196,21 @@ type HostMetrics struct {
 	DiskUsedBytes  uint64  `json:"diskUsedBytes"`
 }
 
-// ContainerReport is a single service's status in a heartbeat.
-type ContainerReport struct {
+// Condition is one reconcile-condition the agent reports (Kubernetes-style status). Type is one of
+// Ready | Reconciling | Blocked | Degraded; Status is true | false | unknown; Reason is a machine
+// code (InSync | Reconciling | ReconcileError | AwaitingDnsDelegation | ServiceUnhealthy).
+type Condition struct {
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason"`
+	Message   string `json:"message"`
+	Component string `json:"component,omitempty"` // core | database | edge | gitea | secretStore
+	Since     string `json:"since"`               // RFC3339 transition timestamp
+}
+
+// ServiceStatus is a single service's runtime status in a heartbeat, tagged with its component.
+type ServiceStatus struct {
+	Component   string  `json:"component"` // core | database | edge | gitea
 	Service     string  `json:"service"`
 	Name        string  `json:"name"`
 	State       string  `json:"state"`
@@ -179,20 +219,26 @@ type ContainerReport struct {
 	MemoryBytes uint64  `json:"memoryBytes"`
 }
 
+// Event is one notable transition the agent asks cloud to record on the deployment timeline.
+type Event struct {
+	Level     string `json:"level"`               // info | warn | error
+	Component string `json:"component,omitempty"` // core | database | edge | gitea | secretStore
+	Reason    string `json:"reason"`              // machine reason code
+	Message   string `json:"message"`
+}
+
 // StatusReport is the periodic heartbeat the agent pushes to cloud.
 type StatusReport struct {
-	DeploymentID string            `json:"deploymentId"`
-	Generation   int64             `json:"generation"` // desired-state generation currently applied
-	Phase        string            `json:"phase"`      // enrolled | reconciling | ready | error
-	Message      string            `json:"message"`
-	Containers   []ContainerReport `json:"containers"`
-	// GiteaProvisioned tells core-server (via cloud) the Gitea user+PAT are stored.
-	GiteaProvisioned bool `json:"giteaProvisioned"`
+	DeploymentID string          `json:"deploymentId"`
+	Generation   int64           `json:"generation"` // desired-state generation currently applied
+	Conditions   []Condition     `json:"conditions"` // reconcile conditions observed by the agent
+	Services     []ServiceStatus `json:"services"`   // per-service runtime states, tagged by component
+	Host         *HostMetrics    `json:"host,omitempty"`
 	// Certificates report each managed-edge cert's expiry so cloud can track/alert (system of record).
-	Certificates []CertReport `json:"certificates"`
-	// AcmeDelegation, when non-nil, is the one-time CNAME the operator must add before the wildcard
-	// cert can be issued (surfaced in the wizard's DNS-Delegation step).
-	AcmeDelegation *AcmeChallengeDelegation `json:"acmeDelegation,omitempty"`
-	// Host is the VM's whole-machine resource usage (CPU/memory/disk) at heartbeat time.
-	Host *HostMetrics `json:"host,omitempty"`
+	Certificates []CertReport `json:"certificates,omitempty"`
+	// Delegation, when non-nil, is the one-time CNAME the operator must add before the wildcard cert
+	// can be issued (present while the edge is Blocked awaiting the operator, absent once issued).
+	Delegation *AcmeChallengeDelegation `json:"delegation,omitempty"`
+	// Events are notable transitions the agent asks cloud to record on the deployment timeline.
+	Events []Event `json:"events,omitempty"`
 }

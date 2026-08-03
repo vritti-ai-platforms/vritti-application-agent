@@ -36,7 +36,13 @@ const externalDBSecret = "external_db"
 
 // secretProviderPrefix marks sealed secrets that carry the SECRET half of the secret-store auth
 // method. The suffix after the prefix is the reserved auth-secret name (clientSecret, token, ...).
-const secretProviderPrefix = "secretProvider."
+// The prefix matches the `secretStore` component name cloud renamed the provider to.
+const secretProviderPrefix = "secretStore."
+
+// resyncInterval is the periodic full-reconcile cadence when the generation is unchanged and the
+// last reconcile succeeded — it keeps drift corrected and the wildcard cert renewed without needing
+// a generation bump (cert renewal is handled inside reconcile's EnsureWildcard).
+const resyncInterval = 5 * time.Minute
 
 // Agent holds the long-lived collaborators for one deployment.
 type Agent struct {
@@ -54,8 +60,19 @@ type Agent struct {
 	edgeManaged    bool                  // agent runs nginx + the bundled acme-dns wildcard edge
 	certs          []cloudapi.CertReport // last observed managed-edge certs (reported each heartbeat)
 	// acmeDelegation, when set, is the one-time CNAME the operator must add before the wildcard cert
-	// can issue — surfaced in the heartbeat for the wizard's DNS-Delegation step.
+	// can issue — surfaced in the heartbeat for the setup flow's DNS-Delegation step.
 	acmeDelegation *cloudapi.AcmeChallengeDelegation
+
+	// Generation gate + transition tracking (all touched from the single Run/select goroutine).
+	lastReconcileErr    error     // non-nil forces a re-reconcile next tick until it clears
+	lastResync          time.Time // last full-reconcile time (periodic resync cadence)
+	lastErrMsg          string    // dedup: only emit a ReconcileError event when the message changes
+	awaitingSecretStore bool      // blocked: cloud hasn't configured the secret store yet (operator action)
+	issuingWildcard     bool      // an IssuingWildcard event was emitted while awaiting the cert
+	hadCert             bool      // a wildcard cert has been observed on disk (emit CertIssued on 0→1)
+	giteaProvisioned    bool      // the Gitea admin token has been provisioned (emit on transition)
+	// pendingEvents buffers notable transitions until the next heartbeat drains them.
+	pendingEvents []cloudapi.Event
 }
 
 // New bootstraps the agent: loads config, local keys, machine secrets, and the Docker client.
@@ -119,15 +136,19 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 				if err := deploy.RunBackup(ctx, a.dx, bt); err != nil {
 					a.log.Warn("scheduled backup failed", "type", bt, "err", err)
+					a.emit("warn", "database", "BackupFailed", fmt.Sprintf("Scheduled %s backup failed: %v", bt, err))
 				} else {
 					a.log.Info("scheduled backup complete", "type", bt)
+					a.emit("info", "database", "BackupComplete", fmt.Sprintf("Scheduled %s backup complete.", bt))
 				}
 			}
 		}
 	}
 }
 
-// tick fetches the current desired-state, authenticates it, and reconciles once, reporting the outcome.
+// tick fetches the current desired-state, authenticates it, and — generation-gated — reconciles.
+// Health and conditions are collected and reported EVERY tick; the full reconcile pipeline runs only
+// when the generation changed, the last reconcile errored, or the periodic resync interval elapsed.
 func (a *Agent) tick(ctx context.Context) {
 	signed, err := a.cloud.FetchDesiredState(ctx)
 	if err != nil {
@@ -138,21 +159,134 @@ func (a *Agent) tick(ctx context.Context) {
 	ds, err := a.verifyDesiredState(signed)
 	if err != nil {
 		a.log.Error("reject desired-state", "err", err)
-		a.report(ctx, 0, "error", err.Error(), false)
+		a.emitError(err.Error())
+		cond := []cloudapi.Condition{readyCondition("false", "ReconcileError", err.Error())}
+		a.report(ctx, a.lastGeneration, cond, a.collectServices(ctx))
 		return
 	}
 
-	giteaOK, err := a.reconcile(ctx, ds)
-	phase, msg := "ready", ""
-	switch {
-	case err != nil:
-		phase, msg = "error", err.Error()
-		a.log.Error("reconcile failed", "err", err)
-	case a.acmeDelegation != nil:
-		// Cert-first gate: the stack is held until the operator's DNS lands and the wildcard issues.
-		phase, msg = "awaiting-dns", "Waiting for the DNS delegation before provisioning the stack."
+	// Generation gate: reconcile on a new generation, a lingering error, or the resync cadence.
+	if ds.Generation != a.lastGeneration || a.lastReconcileErr != nil || time.Since(a.lastResync) >= resyncInterval {
+		a.lastResync = time.Now()
+		rerr := a.reconcile(ctx, ds)
+		a.lastReconcileErr = rerr
+		if rerr != nil {
+			a.log.Error("reconcile failed", "err", rerr)
+			a.emitError(rerr.Error())
+		} else {
+			a.lastErrMsg = ""
+		}
 	}
-	a.report(ctx, ds.Generation, phase, msg, giteaOK)
+
+	services := a.collectServices(ctx)
+	conditions := a.buildConditions(a.lastReconcileErr, services)
+	a.report(ctx, a.lastGeneration, conditions, services)
+}
+
+// nowRFC is the RFC3339 transition timestamp stamped on conditions.
+func nowRFC() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// readyCondition builds a single Ready condition with the given status/reason/message.
+func readyCondition(status, reason, message string) cloudapi.Condition {
+	return cloudapi.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, Since: nowRFC()}
+}
+
+// buildConditions derives the reported conditions from the reconcile outcome + observed service
+// health, as a strict priority ladder (error → blocked → degraded → reconciling → in-sync).
+func (a *Agent) buildConditions(reconcileErr error, services []cloudapi.ServiceStatus) []cloudapi.Condition {
+	if reconcileErr != nil {
+		return []cloudapi.Condition{readyCondition("false", "ReconcileError", reconcileErr.Error())}
+	}
+	if a.awaitingSecretStore {
+		msg := "Waiting for the secret store to be configured before provisioning."
+		return []cloudapi.Condition{
+			readyCondition("false", "AwaitingSecretStore", msg),
+			{Type: "Blocked", Status: "true", Reason: "AwaitingSecretStore", Component: "secretStore", Message: msg, Since: nowRFC()},
+		}
+	}
+	if a.acmeDelegation != nil {
+		msg := "Add the DNS delegation records so the wildcard certificate can be issued."
+		return []cloudapi.Condition{
+			readyCondition("false", "AwaitingDnsDelegation", msg),
+			{Type: "Blocked", Status: "true", Reason: "AwaitingDnsDelegation", Component: "edge", Message: msg, Since: nowRFC()},
+		}
+	}
+
+	var unhealthy, starting []string
+	for _, s := range services {
+		switch {
+		case s.Health == "unhealthy" || s.State == "exited" || s.State == "dead":
+			unhealthy = append(unhealthy, s.Service)
+		case s.Health == "starting" || s.State == "restarting" || s.State == "created":
+			starting = append(starting, s.Service)
+		}
+	}
+	if len(unhealthy) > 0 {
+		msg := "Unhealthy services: " + strings.Join(unhealthy, ", ") + "."
+		return []cloudapi.Condition{
+			readyCondition("false", "ServiceUnhealthy", msg),
+			{Type: "Degraded", Status: "true", Reason: "ServiceUnhealthy", Message: msg, Since: nowRFC()},
+		}
+	}
+	if len(starting) > 0 {
+		msg := "Services still starting: " + strings.Join(starting, ", ") + "."
+		return []cloudapi.Condition{
+			readyCondition("false", "Reconciling", msg),
+			{Type: "Reconciling", Status: "true", Reason: "Reconciling", Message: msg, Since: nowRFC()},
+		}
+	}
+	return []cloudapi.Condition{readyCondition("true", "InSync", "All services healthy and in sync.")}
+}
+
+// emit buffers a notable transition for the next heartbeat.
+func (a *Agent) emit(level, component, reason, message string) {
+	a.pendingEvents = append(a.pendingEvents, cloudapi.Event{Level: level, Component: component, Reason: reason, Message: message})
+}
+
+// emitError records a ReconcileError event, deduped so a persistent failure isn't emitted every tick.
+func (a *Agent) emitError(msg string) {
+	if msg == a.lastErrMsg {
+		return
+	}
+	a.lastErrMsg = msg
+	a.emit("error", "", "ReconcileError", msg)
+}
+
+// componentForService maps a service name to the component it belongs to (see the shared contract).
+func componentForService(svc string) string {
+	switch svc {
+	case deploy.SvcPostgres:
+		return "database"
+	case deploy.SvcCore, deploy.SvcCommerce, deploy.SvcNats, deploy.SvcRedis:
+		return "core"
+	case deploy.SvcNginx, deploy.SvcAcmeDns:
+		return "edge"
+	case deploy.SvcGitea:
+		return "gitea"
+	default:
+		return ""
+	}
+}
+
+// collectServices reads each owned container's state + health + a resource sample, tagged by component.
+func (a *Agent) collectServices(ctx context.Context) []cloudapi.ServiceStatus {
+	statuses, _ := a.dx.List(ctx)
+	services := make([]cloudapi.ServiceStatus, 0, len(statuses))
+	for _, s := range statuses {
+		ss := cloudapi.ServiceStatus{
+			Component: componentForService(s.Service),
+			Service:   s.Service,
+			Name:      s.Name,
+			State:     s.State,
+			Health:    s.Health,
+		}
+		if sample, err := a.dx.Stats(ctx, s.Name); err == nil {
+			ss.CPUPercent = sample.CPUPercent
+			ss.MemoryBytes = sample.MemoryBytes
+		}
+		services = append(services, ss)
+	}
+	return services
 }
 
 // verifyDesiredState authenticates the signed desired-state and returns the payload decoded from
@@ -168,9 +302,16 @@ func (a *Agent) verifyDesiredState(signed *cloudapi.SignedDesiredState) (cloudap
 	return ds, nil
 }
 
-// reconcile drives the stack toward one already-verified desired-state. Returns whether Gitea is provisioned.
-func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, error) {
-	// (2) Decrypt the sealed secrets once. Names prefixed `secretProvider.` carry the SECRET half of
+// reconcile drives the stack toward one already-verified desired-state.
+func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
+	// (1) Resolve the stack composition from components (nil = component absent). The DB defaults to
+	// managed unless explicitly external; the edge/gitea are off unless their component says otherwise.
+	dbExternal := ds.Components.Database != nil && ds.Components.Database.Mode == cloudapi.ModeExternal
+	dbManaged := !dbExternal
+	pgBackRest := dbManaged && ds.Components.Database != nil && ds.Components.Database.Backup != nil
+	giteaEnabled := ds.Components.Gitea != nil && ds.Components.Gitea.Enabled
+
+	// (2) Decrypt the sealed secrets once. Names prefixed `secretStore.` carry the SECRET half of
 	// the secret-store auth method (client secret, token, jwt, ...) — strip the prefix into
 	// authSecrets. The reserved `external_db` name carries the external-mode DB connection.
 	authSecrets := map[string]string{}
@@ -178,7 +319,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	for name, ciphertext := range ds.SealedSecrets {
 		plain, err := a.keys.OpenSealed(ciphertext)
 		if err != nil {
-			return false, fmt.Errorf("open sealed secret %q: %w", name, err)
+			return fmt.Errorf("open sealed secret %q: %w", name, err)
 		}
 		switch {
 		case strings.HasPrefix(name, secretProviderPrefix):
@@ -192,24 +333,30 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	// from cloud, never from env/ansible), then read each service's COMPLETE container env through it
 	// (imports merged, refs expanded). coreEnv/commerceEnv ARE the container envs; agentEnv holds only
 	// the raw provisioning creds (data-store passwords + Gitea admin bootstrap) to stand up the infra.
-	if ds.SecretProvider == nil {
-		return false, fmt.Errorf("desired-state has no secretProvider — Model B requires a cloud-configured secret store")
+	// The secret store is configured post-create in the in-view setup flow, so it can be nil for a
+	// while at first reconcile. Treat that as a steady operator-action block (like the DNS delegation):
+	// early-return without an error so we keep re-running each tick — without advancing lastGeneration
+	// or setting lastReconcileErr — until cloud supplies it. No event (it's a block, not a transition).
+	if ds.Components.SecretStore == nil {
+		a.awaitingSecretStore = true
+		return nil
 	}
-	provider, err := secretprovider.New(ctx, *ds.SecretProvider, authSecrets)
+	a.awaitingSecretStore = false
+	provider, err := secretprovider.New(ctx, *ds.Components.SecretStore, authSecrets)
 	if err != nil {
-		return false, fmt.Errorf("secret provider: %w", err)
+		return fmt.Errorf("secret provider: %w", err)
 	}
 	coreEnv, err := provider.Fetch(ctx, "/core-server")
 	if err != nil {
-		return false, fmt.Errorf("secrets /core-server: %w", err)
+		return fmt.Errorf("secrets /core-server: %w", err)
 	}
 	commerceEnv, err := provider.Fetch(ctx, "/commerce-service")
 	if err != nil {
-		return false, fmt.Errorf("secrets /commerce-service: %w", err)
+		return fmt.Errorf("secrets /commerce-service: %w", err)
 	}
 	agentEnv, err := provider.Fetch(ctx, "/agent")
 	if err != nil {
-		return false, fmt.Errorf("secrets /agent: %w", err)
+		return fmt.Errorf("secrets /agent: %w", err)
 	}
 
 	// (4) Derive the managed-mode provisioning values + Gitea admin creds from the `/agent` map.
@@ -226,30 +373,30 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	// (5) Resolve the DB connection — the mode branch (managed = provisioning creds, external = sealed).
 	db, err := deploy.ResolveDBConn(ds, prov, externalSecret)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// (6) Ensure infra: network + host bind directories.
 	if err := a.dx.EnsureNetwork(ctx, deploy.Network); err != nil {
-		return false, err
+		return err
 	}
 	for _, dir := range deploy.Dirs(a.cfg.StackRoot, ds) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return false, err
+			return err
 		}
 	}
 	// The core-server / commerce-service containers run as uid 1001 (nestjs) and write to their
 	// bind-mounted /app/logs — hand the host log dir to that uid, else the app boots then crashes with
 	// "EACCES: permission denied, open 'logs/…'". Applies in both DB modes (the app always logs).
 	if err := os.Chown(deploy.CoreLogDir(a.cfg.StackRoot), deploy.CoreServerUID, deploy.CoreServerUID); err != nil {
-		return false, fmt.Errorf("chown core log dir: %w", err)
+		return fmt.Errorf("chown core log dir: %w", err)
 	}
 	// MkdirAll creates the pgdata dir owned by the (root) agent, but the postgres container runs as
 	// uid 999 and must be able to write its bind-mounted data dir — hand ownership over, else initdb
 	// fails with "mkdir: cannot create directory '/var/lib/postgresql/data': Permission denied".
-	if ds.Mode == cloudapi.ModeManaged {
+	if dbManaged {
 		if err := os.Chown(deploy.PostgresDataDir(a.cfg.StackRoot), deploy.PostgresUID, deploy.PostgresUID); err != nil {
-			return false, fmt.Errorf("chown postgres data dir: %w", err)
+			return fmt.Errorf("chown postgres data dir: %w", err)
 		}
 	}
 
@@ -259,20 +406,32 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	// provisioning, and GATE the stack on it. This means the app containers never start until the
 	// operator's DNS is in place and the cert exists — no point serving nothing over TLS. edge=external
 	// skips this (a BYO ingress/LB fronts core, so the agent runs no nginx/acme-dns).
-	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal && ds.BaseDomain != ""
+	a.edgeManaged = ds.Components.Edge != nil && ds.Components.Edge.Mode == cloudapi.EdgeManaged && ds.BaseDomain != ""
 	if a.edgeManaged {
 		delegation, issued, certs, err := deploy.EnsureWildcard(ctx, a.dx, ds, a.cfg.StackRoot)
 		if err != nil {
-			return false, err
+			return err
 		}
 		a.acmeDelegation = delegation
 		a.certs = certs
 		keep[deploy.SvcAcmeDns] = true
 		if !issued {
-			// Waiting on the operator's DNS (zone delegation + CNAME). Keep acme-dns running and retry
-			// next tick; do NOT provision the app stack until the wildcard is in place.
-			return false, nil
+			// Waiting on the operator's DNS (zone delegation + CNAME). Announce it once so the timeline
+			// shows the stack is blocked on DNS; keep acme-dns running and retry next tick; do NOT
+			// provision the app stack until the wildcard is in place.
+			if !a.issuingWildcard {
+				a.issuingWildcard = true
+				a.emit("info", "edge", "IssuingWildcard",
+					fmt.Sprintf("Issuing wildcard certificate for *.%s — add the DNS delegation records.", ds.BaseDomain))
+			}
+			return nil
 		}
+		// Cert is in place. Announce the first issuance (0→1) on the timeline.
+		if !a.hadCert {
+			a.hadCert = true
+			a.emit("info", "edge", "CertIssued", fmt.Sprintf("Wildcard certificate issued for *.%s.", ds.BaseDomain))
+		}
+		a.issuingWildcard = false
 	} else {
 		a.acmeDelegation = nil
 		a.certs = nil
@@ -280,8 +439,8 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 
 	// (7) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
 	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
-	archiving := ds.Mode == cloudapi.ModeManaged && ds.AddOns.PgBackRest
-	if ds.Mode == cloudapi.ModeManaged {
+	archiving := pgBackRest
+	if dbManaged {
 		if archiving {
 			// Config must exist before Postgres boots so archive_command works from the first WAL.
 			// The S3-compatible OFFSITE backup creds (S3_*) live in a DEDICATED `/backup` secret-store
@@ -296,47 +455,52 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 			confPath := filepath.Join(confDir, "pgbackrest.conf")
 			conf := deploy.RenderPgBackRestConf(ds, a.machine, backupEnv, db.OwnerUser)
 			if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
-				return false, err
+				return err
 			}
 			// pgBackRest runs as the postgres OS user (uid 999) and must READ this config + WRITE the
 			// local repo — hand the conf dir, the conf file, and the repo dir to that uid, else it fails
 			// "permission denied" on the root-owned mount.
 			for _, path := range []string{confDir, confPath, deploy.PgBackRestRepoDir(a.cfg.StackRoot)} {
 				if err := os.Chown(path, deploy.PostgresUID, deploy.PostgresUID); err != nil {
-					return false, fmt.Errorf("chown %s: %w", path, err)
+					return fmt.Errorf("chown %s: %w", path, err)
 				}
 			}
 		}
 		pg := deploy.PostgresSpec(ds, db, a.cfg.StackRoot, archiving)
 		if err := deploy.Apply(ctx, a.dx, pg); err != nil {
-			return false, fmt.Errorf("postgres: %w", err)
+			return fmt.Errorf("postgres: %w", err)
 		}
 		keep[pg.Name] = true
 		if err := a.dx.WaitHealthy(ctx, deploy.SvcPostgres, 90*time.Second); err != nil {
-			return false, err
+			return err
 		}
 		if err := deploy.EnsureManagedDatabase(ctx, a.dx, db); err != nil {
-			return false, err
+			return err
 		}
 		if archiving {
 			if err := deploy.EnsureStanza(ctx, a.dx); err != nil {
-				return false, err
+				return err
 			}
 			if !a.hadFullBackup {
 				if err := deploy.RunBackup(ctx, a.dx, "full"); err != nil {
-					return false, err
+					return err
 				}
 				a.hadFullBackup = true
+				a.emit("info", "database", "BackupComplete", "Initial full backup complete.")
 			}
 		}
 	}
 	a.archiving = archiving
+	// pgBackRest turned off since the last reconcile — reset so a re-enable takes a fresh base backup.
+	if !archiving {
+		a.hadFullBackup = false
+	}
 
 	// (8) Render the commerce env verbatim, then run migrations (owner conn) to completion before the
 	// app services roll. core-migrate runs without the Gitea additions (they aren't needed for DDL).
 	commerceEnvSlice := deploy.RenderServiceEnv(commerceEnv)
 	if err := a.migrate(ctx, ds, deploy.RenderCoreEnv(coreEnv, "", ""), commerceEnvSlice); err != nil {
-		return false, err
+		return err
 	}
 
 	// (9) Reconcile the core long-running services.
@@ -348,29 +512,34 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 
 	// (10) Gitea add-on: start it, then bootstrap the admin token BEFORE rendering core's env so
 	// core boots already knowing GITEA_BASE_URL + GITEA_ADMIN_TOKEN and can create the app user + PAT.
-	giteaProvisioned := false
 	giteaURL, giteaToken := "", ""
-	if ds.AddOns.Gitea {
+	if giteaEnabled {
 		// gitea runs as uid 1000 and writes its bind-mounted /data — hand ownership over, else it
 		// crashes reading /data/gitea/conf/app.ini with "permission denied" on the root-owned mount.
 		if err := os.Chown(deploy.GiteaDataDir(a.cfg.StackRoot), deploy.GiteaUID, deploy.GiteaUID); err != nil {
-			return false, fmt.Errorf("chown gitea data dir: %w", err)
+			return fmt.Errorf("chown gitea data dir: %w", err)
 		}
 		giteaSpec := deploy.GiteaSpec(ds, db, a.cfg.StackRoot)
 		if err := deploy.Apply(ctx, a.dx, giteaSpec); err != nil {
-			return false, fmt.Errorf("gitea: %w", err)
+			return fmt.Errorf("gitea: %w", err)
 		}
 		keep[giteaSpec.Name] = true
 		if err := a.dx.WaitHealthy(ctx, deploy.SvcGitea, 90*time.Second); err != nil {
-			return false, err
+			return err
 		}
 		token, err := gitea.ProvisionAdminToken(ctx, a.dx, giteaAdminUser, giteaAdminPw, a.cfg.DataDir)
 		if err != nil {
-			return false, err
+			return err
 		}
 		giteaURL = "http://" + deploy.SvcGitea + ":3000"
 		giteaToken = token
-		giteaProvisioned = true
+		if !a.giteaProvisioned {
+			a.giteaProvisioned = true
+			a.emit("info", "gitea", "GiteaProvisioned", "Gitea provisioned; admin token stored.")
+		}
+	} else {
+		// Add-on off — reset so a later re-enable re-announces provisioning on the timeline.
+		a.giteaProvisioned = false
 	}
 
 	// core-server rendered last so it carries the Gitea admin token when the add-on is on.
@@ -379,7 +548,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 
 	for _, spec := range longRunning {
 		if err := deploy.Apply(ctx, a.dx, spec); err != nil {
-			return giteaProvisioned, fmt.Errorf("%s: %w", spec.Name, err)
+			return fmt.Errorf("%s: %w", spec.Name, err)
 		}
 		keep[spec.Name] = true
 	}
@@ -390,7 +559,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	if a.edgeManaged {
 		certs, err := deploy.EnsureNginx(ctx, a.dx, ds, a.cfg.StackRoot, coreEnvSlice)
 		if err != nil {
-			return giteaProvisioned, err
+			return err
 		}
 		a.certs = certs
 		keep[deploy.SvcNginx] = true
@@ -399,11 +568,11 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 
 	// (12) Prune anything we own that is no longer in the desired set (e.g. a disabled add-on).
 	if err := a.dx.PruneExcept(ctx, keep); err != nil {
-		return giteaProvisioned, err
+		return err
 	}
 
 	a.lastGeneration = ds.Generation
-	return giteaProvisioned, nil
+	return nil
 }
 
 // migrate runs the core + commerce one-shot migration containers to completion. Each runner reads
@@ -435,29 +604,21 @@ func (a *Agent) migrate(ctx context.Context, ds cloudapi.DesiredState, coreEnv, 
 	return nil
 }
 
-// report pushes a heartbeat with per-service state; failures are logged, not fatal.
-func (a *Agent) report(ctx context.Context, generation int64, phase, msg string, giteaOK bool) {
-	statuses, _ := a.dx.List(ctx)
-	containers := make([]cloudapi.ContainerReport, 0, len(statuses))
-	for _, s := range statuses {
-		cr := cloudapi.ContainerReport{Service: s.Service, Name: s.Name, State: s.State, Health: s.Health}
-		if sample, err := a.dx.Stats(ctx, s.Name); err == nil {
-			cr.CPUPercent = sample.CPUPercent
-			cr.MemoryBytes = sample.MemoryBytes
-		}
-		containers = append(containers, cr)
-	}
+// report pushes a heartbeat with conditions, per-service state, host metrics, certs, delegation, and
+// any buffered events; failures are logged, not fatal (buffered events are re-queued on failure).
+func (a *Agent) report(ctx context.Context, generation int64, conditions []cloudapi.Condition, services []cloudapi.ServiceStatus) {
 	// Whole-VM resource usage — disk read from the stack root (a host bind-mount → the VM's fs).
 	hm := host.Collect(a.cfg.StackRoot)
+	events := a.pendingEvents
+	a.pendingEvents = nil
 	err := a.cloud.ReportStatus(ctx, cloudapi.StatusReport{
-		DeploymentID:     a.cfg.DeploymentID,
-		Generation:       generation,
-		Phase:            phase,
-		Message:          msg,
-		Containers:       containers,
-		GiteaProvisioned: giteaOK,
-		Certificates:     a.certs,
-		AcmeDelegation:   a.acmeDelegation,
+		DeploymentID: a.cfg.DeploymentID,
+		Generation:   generation,
+		Conditions:   conditions,
+		Services:     services,
+		Certificates: a.certs,
+		Delegation:   a.acmeDelegation,
+		Events:       events,
 		Host: &cloudapi.HostMetrics{
 			CPUPercent:     hm.CPUPercent,
 			MemTotalBytes:  hm.MemTotalBytes,
@@ -468,6 +629,8 @@ func (a *Agent) report(ctx context.Context, generation int64, phase, msg string,
 	})
 	if err != nil {
 		a.log.Warn("status report failed", "err", err)
+		// Re-queue the drained events so a transient report failure doesn't drop timeline entries.
+		a.pendingEvents = append(events, a.pendingEvents...)
 	}
 }
 
