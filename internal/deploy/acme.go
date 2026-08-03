@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/providers/dns/acmedns"
 	"github.com/go-acme/lego/v4/registration"
@@ -37,6 +38,10 @@ const (
 	// renewWindow — reissue once the wildcard is within this of expiry (LE certs live 90d).
 	renewWindow = 30 * 24 * time.Hour
 )
+
+// publicDNSResolvers back lego's DNS-01 propagation self-check, so it never depends on the VM's
+// (possibly stale-caching) resolver to see the freshly-written acme-dns challenge TXT.
+var publicDNSResolvers = []string{"1.1.1.1:53", "8.8.8.8:53"}
 
 // acmeDNSZone is the delegated challenge zone the bundled acme-dns is authoritative for.
 func acmeDNSZone(baseDomain string) string { return "acme." + baseDomain }
@@ -205,7 +210,11 @@ func IssueWildcard(baseDomain, email, acmeDNSAPIBase, stackRoot, publicIP string
 	if err != nil {
 		return nil, false, fmt.Errorf("lego client: %w", err)
 	}
-	if err := client.Challenge.SetDNS01Provider(provider); err != nil {
+	// Do lego's DNS-01 propagation self-check against PUBLIC resolvers, not the VM's own resolver —
+	// a self-hosted box's resolver may cache stale/negative answers (esp. after earlier failed setup)
+	// and never see the fresh TXT, leaving lego stuck "waiting for propagation" while LE would validate
+	// fine. Public resolvers see the delegated acme-dns TXT correctly.
+	if err := client.Challenge.SetDNS01Provider(provider, dns01.AddRecursiveNameservers(publicDNSResolvers)); err != nil {
 		return nil, false, fmt.Errorf("set dns01 provider: %w", err)
 	}
 
