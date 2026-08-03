@@ -86,26 +86,55 @@ func RenderNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute
 	return b.String()
 }
 
-// EnsureEdge brings up the managed edge: the bundled acme-dns, the single *.<base> wildcard via lego
-// (DNS-01), and nginx. Returns any pending one-time DNS delegation (the operator's CNAME, surfaced in
-// the wizard) and the wildcard cert report. No certbot, no per-host certs.
-func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string) (*cloudapi.AcmeChallengeDelegation, []cloudapi.CertReport, error) {
-	routes := DerivedRoutes(ds.BaseDomain, envPort(coreEnv, DefaultCorePort), ds.AddOns.Gitea)
+// EnsureWildcard brings up the bundled acme-dns and issues/renews the single *.<base> wildcard via
+// lego (DNS-01). It needs no app config, so the agent runs it BEFORE provisioning the stack and gates
+// provisioning on the result — the cert is created first, then the containers start. Returns the
+// pending one-time CNAME delegation (nil once issuing), whether a usable cert now exists on disk, and
+// the cert report. No certbot, no per-host certs.
+func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string) (*cloudapi.AcmeChallengeDelegation, bool, []cloudapi.CertReport, error) {
 	for _, dir := range EdgeDirs(stackRoot) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, nil, err
+			return nil, false, nil, err
 		}
 	}
 
-	// Bundled acme-dns — authoritative for acme.<base>, so lego can prove control for the wildcard.
-	if ip, err := PublicIP(ctx); err == nil {
-		if err := WriteAcmeDnsConfig(stackRoot, ds.BaseDomain, ip); err != nil {
-			return nil, nil, err
-		}
+	// Bundled acme-dns — authoritative for acme.<base>, so lego can prove control for the wildcard. The
+	// VM's public IP goes in acme-dns' self-records AND the reported zone-delegation glue (A record); a
+	// managed edge can't work without it, so a lookup failure is fatal rather than a broken delegation.
+	publicIP, err := PublicIP(ctx)
+	if err != nil || publicIP == "" {
+		return nil, false, nil, fmt.Errorf("resolve public IP (required for the managed edge acme-dns): %w", err)
+	}
+	if err := WriteAcmeDnsConfig(stackRoot, ds.BaseDomain, publicIP); err != nil {
+		return nil, false, nil, err
 	}
 	if err := Apply(ctx, dx, AcmeDnsSpec(stackRoot)); err != nil {
-		return nil, nil, fmt.Errorf("acme-dns: %w", err)
+		return nil, false, nil, fmt.Errorf("acme-dns: %w", err)
 	}
+	// lego registers/updates records over acme-dns' HTTP API — wait for it to accept connections
+	// (it's applied here, not standing for a while as when the stack ran first), else the first
+	// registration races the container's boot and errors.
+	waitForAcmeDNS(ctx)
+
+	// Issue/renew the single wildcard. On first run this returns the one-time delegation to surface.
+	var delegation *cloudapi.AcmeChallengeDelegation
+	if certNeedsIssue(stackRoot, ds.BaseDomain) {
+		del, issued, err := IssueWildcard(ds.BaseDomain, ds.AcmeEmail, AcmeDNSAPIBase(), stackRoot, publicIP, ds.AcmeStaging)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		if !issued {
+			delegation = del // waiting on the operator's DNS before LE can validate
+		}
+	}
+	return delegation, hasCert(stackRoot, ds.BaseDomain), readCerts(stackRoot, []cloudapi.DomainRoute{{Host: ds.BaseDomain}}), nil
+}
+
+// EnsureNginx renders the edge config off the issued wildcard (routing derived from the base domain),
+// syncs the static web bundles, and (re)starts nginx. Run AFTER the stack is provisioned so upstreams
+// resolve and AFTER the wildcard exists (gated by the caller), so nginx comes up serving HTTPS.
+func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string) ([]cloudapi.CertReport, error) {
+	routes := DerivedRoutes(ds.BaseDomain, envPort(coreEnv, DefaultCorePort), ds.AddOns.Gitea)
 
 	// Sync the static web bundles (core-web host + entitled MF remotes) into the wildcard web root.
 	// First provision must surface a pull failure so a bad artifact ref is visible; once the host
@@ -113,19 +142,7 @@ func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredStat
 	// deployment to error (nginx serves the on-disk copy and the next tick retries).
 	if _, err := SyncWebBundles(ctx, ds.WebBundles, stackRoot); err != nil {
 		if !hostBundleReady(stackRoot) {
-			return nil, nil, fmt.Errorf("web bundles: %w", err)
-		}
-	}
-
-	// Issue/renew the single wildcard. On first run this returns the one-time CNAME to surface.
-	var delegation *cloudapi.AcmeChallengeDelegation
-	if certNeedsIssue(stackRoot, ds.BaseDomain) {
-		del, issued, err := IssueWildcard(ds.BaseDomain, ds.AcmeEmail, AcmeDNSAPIBase(), stackRoot, ds.AcmeStaging)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !issued {
-			delegation = del // waiting on the operator's CNAME before LE can validate
+			return nil, fmt.Errorf("web bundles: %w", err)
 		}
 	}
 
@@ -133,16 +150,16 @@ func EnsureEdge(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredStat
 	// change never recreates the container — reload applies it).
 	changed, err := writeNginxConf(stackRoot, ds.BaseDomain, routes)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := Apply(ctx, dx, NginxSpec(ds, stackRoot)); err != nil {
-		return nil, nil, fmt.Errorf("nginx: %w", err)
+		return nil, fmt.Errorf("nginx: %w", err)
 	}
 	if changed {
 		_, _, _ = dx.Exec(ctx, SvcNginx, []string{"nginx", "-s", "reload"})
 	}
 
-	return delegation, readCerts(stackRoot, []cloudapi.DomainRoute{{Host: ds.BaseDomain}}), nil
+	return readCerts(stackRoot, []cloudapi.DomainRoute{{Host: ds.BaseDomain}}), nil
 }
 
 // writeNginxConf writes the rendered config to conf.d/vritti.conf, reporting whether the content changed.

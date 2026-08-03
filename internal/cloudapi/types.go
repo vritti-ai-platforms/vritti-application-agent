@@ -39,12 +39,21 @@ type CertReport struct {
 	IssuedAt string `json:"issuedAt"` // RFC3339 not-before
 }
 
-// AcmeChallengeDelegation is the ONE-TIME CNAME the operator must add so the agent's local acme-dns
-// can answer the wildcard DNS-01 challenge. Surfaced in the heartbeat (→ wizard's DNS-Delegation step)
-// until it's live; nil once the wildcard is issuing/issued. Add `<Name> CNAME <Target>` in any DNS.
+// AcmeChallengeDelegation is the DNS the operator must add so the agent's local acme-dns can answer
+// the wildcard DNS-01 challenge. Surfaced in the heartbeat (→ wizard's DNS-Delegation step) until the
+// cert is issued; nil once issued. TWO records are required:
+//
+//  1. Zone delegation (one-time, stable): delegate the acme-dns zone to this VM so Let's Encrypt can
+//     reach it —  `<Zone> NS <Zone>.`  and  `<Zone> A <ServerIP>`  (glue). acme-dns is self-named, so
+//     the NS record's name and value are both Zone.
+//  2. Challenge CNAME (per acme-dns account):  `<Name> CNAME <Target>.`
+//
+// Without (1) the CNAME is a dead end — the zone has no nameserver, so LE can't resolve the TXT.
 type AcmeChallengeDelegation struct {
-	Name   string `json:"name"`   // e.g. _acme-challenge.apw1.vrittiai.com
-	Target string `json:"target"` // e.g. <id>.acme.apw1.vrittiai.com
+	Name     string `json:"name"`     // CNAME record name: _acme-challenge.<base>
+	Target   string `json:"target"`   // CNAME record value: <id>.acme.<base>
+	Zone     string `json:"zone"`     // NS zone-delegation name AND value: acme.<base>
+	ServerIP string `json:"serverIp"` // glue A for the nameserver — the VM's public IP
 }
 
 // WebBundle is one static web artifact (OCI, a gzipped bundle) the managed edge serves off the

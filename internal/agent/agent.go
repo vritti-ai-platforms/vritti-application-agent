@@ -143,9 +143,13 @@ func (a *Agent) tick(ctx context.Context) {
 
 	giteaOK, err := a.reconcile(ctx, ds)
 	phase, msg := "ready", ""
-	if err != nil {
+	switch {
+	case err != nil:
 		phase, msg = "error", err.Error()
 		a.log.Error("reconcile failed", "err", err)
+	case a.acmeDelegation != nil:
+		// Cert-first gate: the stack is held until the operator's DNS lands and the wildcard issues.
+		phase, msg = "awaiting-dns", "Waiting for the DNS delegation before provisioning the stack."
 	}
 	a.report(ctx, ds.Generation, phase, msg, giteaOK)
 }
@@ -250,6 +254,29 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 
 	keep := map[string]bool{}
 
+	// (6.5) Managed edge, CERT-FIRST: bring up acme-dns and issue the single *.<base> wildcard BEFORE
+	// provisioning, and GATE the stack on it. This means the app containers never start until the
+	// operator's DNS is in place and the cert exists — no point serving nothing over TLS. edge=external
+	// skips this (a BYO ingress/LB fronts core, so the agent runs no nginx/acme-dns).
+	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal && ds.BaseDomain != ""
+	if a.edgeManaged {
+		delegation, issued, certs, err := deploy.EnsureWildcard(ctx, a.dx, ds, a.cfg.StackRoot)
+		if err != nil {
+			return false, err
+		}
+		a.acmeDelegation = delegation
+		a.certs = certs
+		keep[deploy.SvcAcmeDns] = true
+		if !issued {
+			// Waiting on the operator's DNS (zone delegation + CNAME). Keep acme-dns running and retry
+			// next tick; do NOT provision the app stack until the wildcard is in place.
+			return false, nil
+		}
+	} else {
+		a.acmeDelegation = nil
+		a.certs = nil
+	}
+
 	// (7) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
 	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
 	archiving := ds.Mode == cloudapi.ModeManaged && ds.AddOns.PgBackRest
@@ -335,25 +362,17 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 		keep[spec.Name] = true
 	}
 
-	// (11) Managed edge (core service): nginx + certbot for the provided domains. Edge=external means
-	// something else fronts core (shared vm1 edge, a customer LB, a tunnel) — no nginx, no certbot.
-	// pgBackRest is NOT a container — archiving lives in the Postgres spec (step 5) and scheduled
-	// backups run via `docker exec` on the backup ticker.
-	// Managed edge runs only when there's a base domain to serve. edge=external means BYO edge; the
-	// agent then runs no nginx/acme-dns. Routing (api./git./*.) is derived from the base domain.
-	a.edgeManaged = ds.Edge != cloudapi.EdgeExternal && ds.BaseDomain != ""
+	// (11) Managed edge: the wildcard already exists (step 6.5) and the stack is now up, so render the
+	// derived routes (api./git./*.) + sync the web bundles and (re)start nginx — it comes up serving
+	// HTTPS immediately. edge=external means a BYO ingress/LB fronts core: no nginx, no acme-dns.
 	if a.edgeManaged {
-		delegation, certs, err := deploy.EnsureEdge(ctx, a.dx, ds, a.cfg.StackRoot, coreEnvSlice)
+		certs, err := deploy.EnsureNginx(ctx, a.dx, ds, a.cfg.StackRoot, coreEnvSlice)
 		if err != nil {
 			return giteaProvisioned, err
 		}
 		a.certs = certs
-		a.acmeDelegation = delegation
 		keep[deploy.SvcNginx] = true
 		keep[deploy.SvcAcmeDns] = true
-	} else {
-		a.certs = nil
-		a.acmeDelegation = nil
 	}
 
 	// (12) Prune anything we own that is no longer in the desired set (e.g. a disabled add-on).

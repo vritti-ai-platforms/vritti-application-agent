@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +44,24 @@ func acmeDNSZone(baseDomain string) string { return "acme." + baseDomain }
 // AcmeDNSAPIBase is the in-network URL lego uses to reach the bundled acme-dns HTTP API (the agent
 // must share the stack network so this name resolves).
 func AcmeDNSAPIBase() string { return fmt.Sprintf("http://%s:%d", SvcAcmeDns, acmeDNSAPIPort) }
+
+// waitForAcmeDNS blocks until the bundled acme-dns HTTP API accepts TCP connections, or ~20s passes.
+// When the wildcard is issued BEFORE the stack (cert-first), acme-dns was only just applied, so lego's
+// first register/record call would otherwise race the container's boot and error.
+func waitForAcmeDNS(ctx context.Context) {
+	addr := net.JoinHostPort(SvcAcmeDns, strconv.Itoa(acmeDNSAPIPort))
+	for range 40 {
+		if conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
 
 // AcmeDnsSpec is the bundled acme-dns: public authoritative DNS on :53 (Let's Encrypt resolves the
 // wildcard challenge TXTs here) + an HTTP API on the private network (lego writes the rotating TXTs).
@@ -145,7 +165,7 @@ func (u *acmeUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
 // api./git./every tenant subdomain. Returns:
 //   - (delegation, false, nil) → a one-time CNAME the operator must add before issuance can complete
 //   - (nil, true, nil)         → issued; written to live/<base>/{fullchain,privkey}.pem for nginx
-func IssueWildcard(baseDomain, email, acmeDNSAPIBase, stackRoot string, staging bool) (*cloudapi.AcmeChallengeDelegation, bool, error) {
+func IssueWildcard(baseDomain, email, acmeDNSAPIBase, stackRoot, publicIP string, staging bool) (*cloudapi.AcmeChallengeDelegation, bool, error) {
 	if baseDomain == "" {
 		return nil, false, nil
 	}
@@ -198,7 +218,12 @@ func IssueWildcard(baseDomain, email, acmeDNSAPIBase, stackRoot string, staging 
 		// CNAME wired before Let's Encrypt can resolve the challenge. Surface it instead of failing.
 		var need acmedns.ErrCNAMERequired
 		if errors.As(err, &need) {
-			return &cloudapi.AcmeChallengeDelegation{Name: need.FQDN, Target: need.Target}, false, nil
+			return &cloudapi.AcmeChallengeDelegation{
+				Name:     need.FQDN,
+				Target:   need.Target,
+				Zone:     acmeDNSZone(baseDomain),
+				ServerIP: publicIP,
+			}, false, nil
 		}
 		return nil, false, fmt.Errorf("obtain wildcard: %w", err)
 	}
