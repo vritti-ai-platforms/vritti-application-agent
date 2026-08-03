@@ -81,8 +81,9 @@ type Images struct {
 // AddOns are the truly optional stack features toggled per deployment. nginx is NOT here — it is a
 // core service governed by DesiredState.Edge.
 type AddOns struct {
-	PgBackRest bool `json:"pgBackRest"` // premium; only meaningful with ModeManaged
-	Gitea      bool `json:"gitea"`
+	PgBackRest      bool `json:"pgBackRest"`      // premium; only meaningful with ModeManaged
+	BackupRetention int  `json:"backupRetention"` // pgBackRest full backups kept (repo*-retention-full); <1 falls back to 4
+	Gitea           bool `json:"gitea"`
 }
 
 // SecretProviderAuth selects how the agent authenticates to the secret store. Non-secret params

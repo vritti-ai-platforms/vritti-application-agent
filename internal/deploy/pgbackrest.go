@@ -23,10 +23,16 @@ func pgbackrestExec(args string) []string {
 // repo1, and — when R2 config is present in the resolved secrets — an encrypted S3 repo2 on R2.
 // The cipher passphrase is a machine secret (never leaves the VM).
 func RenderPgBackRestConf(ds cloudapi.DesiredState, m *secrets.Machine, resolved map[string]string) string {
+	// Retention (full backups kept) comes from cloud in the desired-state; guard the unset/legacy 0.
+	retention := ds.AddOns.BackupRetention
+	if retention < 1 {
+		retention = 4
+	}
+
 	var b strings.Builder
 	b.WriteString("[global]\n")
 	b.WriteString("repo1-path=/var/lib/pgbackrest\n")
-	b.WriteString("repo1-retention-full=4\n")
+	fmt.Fprintf(&b, "repo1-retention-full=%d\n", retention)
 	b.WriteString("repo1-cipher-type=aes-256-cbc\n")
 	fmt.Fprintf(&b, "repo1-cipher-pass=%s\n", m.PgBackRestCipherPass)
 
@@ -42,7 +48,7 @@ func RenderPgBackRestConf(ds cloudapi.DesiredState, m *secrets.Machine, resolved
 		fmt.Fprintf(&b, "repo2-s3-key=%s\n", key)
 		fmt.Fprintf(&b, "repo2-s3-key-secret=%s\n", secret)
 		fmt.Fprintf(&b, "repo2-path=/pgbackrest/%s\n", ds.DeploymentID)
-		b.WriteString("repo2-retention-full=4\n")
+		fmt.Fprintf(&b, "repo2-retention-full=%d\n", retention)
 		b.WriteString("repo2-cipher-type=aes-256-cbc\n")
 		fmt.Fprintf(&b, "repo2-cipher-pass=%s\n", m.PgBackRestCipherPass)
 	}
