@@ -160,6 +160,15 @@ type Enrollment struct {
 	DeploymentPubKey string `json:"deploymentPubKey"`
 }
 
+// HostMetrics is the VM's resource usage at heartbeat time (whole-VM, not per-container).
+type HostMetrics struct {
+	CPUPercent     float64 `json:"cpuPercent"`
+	MemTotalBytes  uint64  `json:"memTotalBytes"`
+	MemUsedBytes   uint64  `json:"memUsedBytes"`
+	DiskTotalBytes uint64  `json:"diskTotalBytes"`
+	DiskUsedBytes  uint64  `json:"diskUsedBytes"`
+}
+
 // ContainerReport is a single service's status in a heartbeat.
 type ContainerReport struct {
 	Service     string  `json:"service"`
@@ -184,4 +193,6 @@ type StatusReport struct {
 	// AcmeDelegation, when non-nil, is the one-time CNAME the operator must add before the wildcard
 	// cert can be issued (surfaced in the wizard's DNS-Delegation step).
 	AcmeDelegation *AcmeChallengeDelegation `json:"acmeDelegation,omitempty"`
+	// Host is the VM's whole-machine resource usage (CPU/memory/disk) at heartbeat time.
+	Host *HostMetrics `json:"host,omitempty"`
 }

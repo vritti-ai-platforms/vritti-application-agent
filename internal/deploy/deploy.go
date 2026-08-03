@@ -157,6 +157,13 @@ const GiteaUID = 1000
 // GiteaDataDir is the host bind-mount dir for gitea's /data.
 func GiteaDataDir(stackRoot string) string { return filepath.Join(stackRoot, "gitea") }
 
+// PgBackRestConfDir (mounted /etc/pgbackrest:ro) and PgBackRestRepoDir (mounted /var/lib/pgbackrest)
+// are read/written by pgBackRest running AS the postgres OS user (uid 999) inside the Postgres
+// container, so both must be owned by PostgresUID — else pgBackRest fails "permission denied" on its
+// config / can't write the local repo.
+func PgBackRestConfDir(stackRoot string) string { return filepath.Join(stackRoot, "pgbackrest") }
+func PgBackRestRepoDir(stackRoot string) string { return filepath.Join(stackRoot, "backup") }
+
 // Dirs returns the host bind-mount directories that must exist before containers start.
 func Dirs(stackRoot string, ds cloudapi.DesiredState) []string {
 	dirs := []string{

@@ -23,6 +23,7 @@ import (
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/enroll"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/gitea"
+	"github.com/vritti-ai-platforms/vritti-application-agent/internal/host"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secretprovider"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
 )
@@ -283,11 +284,27 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) (bool, 
 	if ds.Mode == cloudapi.ModeManaged {
 		if archiving {
 			// Config must exist before Postgres boots so archive_command works from the first WAL.
-			// R2 repo creds ride in core-server's env map (R2_*), so read the backup target from there.
-			conf := deploy.RenderPgBackRestConf(ds, a.machine, coreEnv)
-			confPath := filepath.Join(a.cfg.StackRoot, "pgbackrest", "pgbackrest.conf")
+			// The S3-compatible OFFSITE backup creds (S3_*) live in a DEDICATED `/backup` secret-store
+			// folder — NOT `/core-server` (whose bucket is the app's media store). Best-effort: if
+			// `/backup` is absent/empty, pgBackRest runs local-repo only. pg1-user = real superuser.
+			backupEnv, err := provider.Fetch(ctx, "/backup")
+			if err != nil {
+				a.log.Warn("fetch /backup secrets failed — pgBackRest runs local-repo only", "err", err)
+				backupEnv = map[string]string{}
+			}
+			confDir := deploy.PgBackRestConfDir(a.cfg.StackRoot)
+			confPath := filepath.Join(confDir, "pgbackrest.conf")
+			conf := deploy.RenderPgBackRestConf(ds, a.machine, backupEnv, db.OwnerUser)
 			if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
 				return false, err
+			}
+			// pgBackRest runs as the postgres OS user (uid 999) and must READ this config + WRITE the
+			// local repo — hand the conf dir, the conf file, and the repo dir to that uid, else it fails
+			// "permission denied" on the root-owned mount.
+			for _, path := range []string{confDir, confPath, deploy.PgBackRestRepoDir(a.cfg.StackRoot)} {
+				if err := os.Chown(path, deploy.PostgresUID, deploy.PostgresUID); err != nil {
+					return false, fmt.Errorf("chown %s: %w", path, err)
+				}
 			}
 		}
 		pg := deploy.PostgresSpec(ds, db, a.cfg.StackRoot, archiving)
@@ -430,6 +447,8 @@ func (a *Agent) report(ctx context.Context, generation int64, phase, msg string,
 		}
 		containers = append(containers, cr)
 	}
+	// Whole-VM resource usage — disk read from the stack root (a host bind-mount → the VM's fs).
+	hm := host.Collect(a.cfg.StackRoot)
 	err := a.cloud.ReportStatus(ctx, cloudapi.StatusReport{
 		DeploymentID:     a.cfg.DeploymentID,
 		Generation:       generation,
@@ -439,6 +458,13 @@ func (a *Agent) report(ctx context.Context, generation int64, phase, msg string,
 		GiteaProvisioned: giteaOK,
 		Certificates:     a.certs,
 		AcmeDelegation:   a.acmeDelegation,
+		Host: &cloudapi.HostMetrics{
+			CPUPercent:     hm.CPUPercent,
+			MemTotalBytes:  hm.MemTotalBytes,
+			MemUsedBytes:   hm.MemUsedBytes,
+			DiskTotalBytes: hm.DiskTotalBytes,
+			DiskUsedBytes:  hm.DiskUsedBytes,
+		},
 	})
 	if err != nil {
 		a.log.Warn("status report failed", "err", err)
