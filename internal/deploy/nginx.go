@@ -59,8 +59,10 @@ func DerivedRoutes(baseDomain string, corePort int, gitea bool) []cloudapi.Domai
 // RenderNginxConf builds the edge config off the single *.<base> wildcard cert: an HTTP→HTTPS
 // redirect, a proxy block per derived route (api./git.), and the wildcard static block serving
 // core-web/MF bundles for every other (tenant) subdomain. Cert-aware: before the wildcard is issued
-// it emits HTTP-only (nginx stays valid); the HTTPS blocks appear once the cert exists.
-func RenderNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute) string {
+// it emits HTTP-only (nginx stays valid); the HTTPS blocks appear once the cert exists. corePort is
+// the port core-server binds — the *.<base> block proxies same-origin /api/* there (tenant core-web
+// calls /api/... on its own subdomain).
+func RenderNginxConf(stackRoot, baseDomain string, corePort int, routes []cloudapi.DomainRoute) string {
 	var b strings.Builder
 	b.WriteString("server {\n  listen 80;\n  server_name _;\n  location / { return 301 https://$host$request_uri; }\n}\n\n")
 
@@ -80,8 +82,16 @@ func RenderNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute
 		b.WriteString("    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n  }\n}\n\n")
 	}
 
-	// Wildcard catch-all: tenant subdomains → the static core-web SPA (populated by the bundle sync).
+	// Wildcard catch-all: tenant subdomains serve the static core-web SPA, and its same-origin /api/*
+	// calls proxy (prefix stripped) to core-server — mirroring the cloud edge — so /api/auth/status hits
+	// the API instead of returning index.html. The /api/ location must precede the SPA try_files.
+	coreUpstream := fmt.Sprintf("http://%s:%d", SvcCore, corePort)
 	b.WriteString("server {\n  listen 443 ssl;\n  http2 on;\n  server_name *." + baseDomain + ";\n" + tls)
+	b.WriteString("  location /api/ {\n    rewrite ^/api/(.*)$ /$1 break;\n    proxy_pass " + coreUpstream + ";\n    proxy_http_version 1.1;\n")
+	b.WriteString("    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n")
+	b.WriteString("    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $scheme;\n")
+	b.WriteString("    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n")
+	b.WriteString("    proxy_buffering off;\n    proxy_read_timeout 3600s;\n  }\n")
 	b.WriteString("  root /var/www/core-web;\n  location / { try_files $uri /index.html; }\n}\n\n")
 	return b.String()
 }
@@ -194,7 +204,8 @@ func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.Desired
 // resolve and AFTER the wildcard exists (gated by the caller), so nginx comes up serving HTTPS.
 func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string) ([]cloudapi.CertReport, error) {
 	giteaEnabled := ds.Components.Gitea != nil && ds.Components.Gitea.Enabled
-	routes := DerivedRoutes(ds.BaseDomain, envPort(coreEnv, DefaultCorePort), giteaEnabled)
+	corePort := envPort(coreEnv, DefaultCorePort)
+	routes := DerivedRoutes(ds.BaseDomain, corePort, giteaEnabled)
 
 	// Sync the static web bundles (core-web host + entitled MF remotes) into the wildcard web root.
 	// First provision must surface a pull failure so a bad artifact ref is visible; once the host
@@ -208,7 +219,7 @@ func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredSta
 
 	// Render (wildcard cert-aware) + ensure nginx, reload on any change (conf is a bind-mount, so a
 	// change never recreates the container — reload applies it).
-	changed, err := writeNginxConf(stackRoot, ds.BaseDomain, routes)
+	changed, err := writeNginxConf(stackRoot, ds.BaseDomain, corePort, routes)
 	if err != nil {
 		return nil, err
 	}
@@ -223,9 +234,9 @@ func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredSta
 }
 
 // writeNginxConf writes the rendered config to conf.d/vritti.conf, reporting whether the content changed.
-func writeNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute) (bool, error) {
+func writeNginxConf(stackRoot, baseDomain string, corePort int, routes []cloudapi.DomainRoute) (bool, error) {
 	path := filepath.Join(stackRoot, "nginx", "conf.d", "vritti.conf")
-	next := []byte(RenderNginxConf(stackRoot, baseDomain, routes))
+	next := []byte(RenderNginxConf(stackRoot, baseDomain, corePort, routes))
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, next) {
 		return false, nil
 	}

@@ -8,10 +8,20 @@ import "sort"
 // the app crypto secrets, etc.) — the raw provisioning creds live in the `/agent` folder, not
 // here, so there is nothing to strip. The same rendering feeds both the migrate runner and the
 // long-running container (the migrate call passes empty gitea args).
-func RenderCoreEnv(coreEnv map[string]string, giteaURL, giteaToken string) []string {
+//
+// BASE_DOMAIN + REFRESH_COOKIE_DOMAIN are OVERRIDDEN with the desired-state's baseDomain (a bare
+// hostname like sheshu.vrittiai.com). core-server derives the tenant subdomain via
+// host.endsWith('.'+BASE_DOMAIN), which needs a scheme-less host — operators who set
+// BASE_DOMAIN=https://… in Infisical would otherwise break subdomain resolution ("org not found").
+// The agent is authoritative here, so cloud's canonical base domain always wins.
+func RenderCoreEnv(coreEnv map[string]string, baseDomain, giteaURL, giteaToken string) []string {
 	env := make(map[string]string, len(coreEnv)+2)
 	for k, v := range coreEnv {
 		env[k] = v
+	}
+	if baseDomain != "" {
+		env["BASE_DOMAIN"] = baseDomain
+		env["REFRESH_COOKIE_DOMAIN"] = baseDomain
 	}
 	if giteaURL != "" {
 		env["GITEA_BASE_URL"] = giteaURL

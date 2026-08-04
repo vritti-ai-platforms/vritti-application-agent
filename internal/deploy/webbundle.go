@@ -41,7 +41,33 @@ func SyncWebBundles(ctx context.Context, bundles []cloudapi.WebBundle, stackRoot
 		}
 		changed = changed || c
 	}
+	// oras pull leaves the extracted tree mode 750 root:root, but nginx workers run as the unprivileged
+	// `nginx` user and only bind-mount the web root read-only — without world traverse/read they hit
+	// "stat() … (13: Permission denied)" on index.html and every *.<base> host 500s. Make the whole tree
+	// world-readable (a+rX) every reconcile; it's cheap and idempotent.
+	if err := makeWorldReadable(webRoot(stackRoot)); err != nil {
+		return changed, fmt.Errorf("web root permissions: %w", err)
+	}
 	return changed, nil
+}
+
+// makeWorldReadable walks root setting directories to 0755 and files to 0644 (a+rX semantics), so the
+// unprivileged nginx worker can traverse + read every served static asset. Idempotent; a not-yet-created
+// root is a no-op.
+func makeWorldReadable(root string) error {
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return nil
+	}
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o644)
+		if d.IsDir() {
+			mode = 0o755
+		}
+		return os.Chmod(path, mode)
+	})
 }
 
 // syncWebBundle pulls one artifact and extracts it, skipping the pull when the recorded digest for

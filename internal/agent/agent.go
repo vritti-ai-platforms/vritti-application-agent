@@ -627,7 +627,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// app services roll. core-migrate runs without the Gitea additions (they aren't needed for DDL).
 	commerceEnvSlice := deploy.RenderServiceEnv(commerceEnv)
 	a.step(ds.Generation, "core", "RunningMigrations", "Running database migrations.")
-	if err := a.migrate(ctx, ds, deploy.RenderCoreEnv(coreEnv, "", ""), commerceEnvSlice); err != nil {
+	if err := a.migrate(ctx, ds, deploy.RenderCoreEnv(coreEnv, ds.BaseDomain, "", ""), commerceEnvSlice); err != nil {
 		return err
 	}
 
@@ -672,7 +672,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	}
 
 	// core-server rendered last so it carries the Gitea admin token when the add-on is on.
-	coreEnvSlice := deploy.RenderCoreEnv(coreEnv, giteaURL, giteaToken)
+	coreEnvSlice := deploy.RenderCoreEnv(coreEnv, ds.BaseDomain, giteaURL, giteaToken)
 	longRunning = append(longRunning, deploy.CoreServerSpec(ds, coreEnvSlice, a.cfg.StackRoot))
 
 	a.step(ds.Generation, "core", "StartingServices", "Starting the core services (redis, nats, commerce, core-server).")
