@@ -88,13 +88,19 @@ func RenderNginxConf(stackRoot, baseDomain string, routes []cloudapi.DomainRoute
 
 // EnsureWildcard brings up the bundled acme-dns and issues/renews the single *.<base> wildcard via
 // lego (DNS-01). It needs no app config, so the agent runs it BEFORE provisioning the stack and gates
-// provisioning on the result — the cert is created first, then the containers start. Returns the
-// pending one-time CNAME delegation (nil once issuing), whether a usable cert now exists on disk, and
-// the cert report. No certbot, no per-host certs.
-func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string) (*cloudapi.AcmeChallengeDelegation, bool, []cloudapi.CertReport, error) {
+// provisioning on the result — the cert is created first, then the containers start.
+//
+// It is pre-flight-guarded: once the acme-dns account exists (the CNAME target is known), it will NOT
+// call Let's Encrypt until dnsDelegationReady confirms the operator's records actually resolve, which
+// stops the repeated propagation-timeout bursts (and LE churn) during DNS propagation. On the very
+// first attempt (no account yet) it calls lego once to register the account + surface the one-time
+// CNAME. The (categorized) result tells the agent which condition/event/cadence to use — no hard error
+// for a DNS/throttle wait; the agent enforces the rate-limit/failure backoff by not reconciling inside
+// its backoff window. `err` carries the underlying detail (nil, or set for Error/RateLimited/propagation).
+func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, prev *cloudapi.AcmeChallengeDelegation) (WildcardResult, error) {
 	for _, dir := range EdgeDirs(stackRoot) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, false, nil, err
+			return WildcardResult{Outcome: WildcardOutcomeError}, err
 		}
 	}
 
@@ -103,35 +109,84 @@ func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.Desired
 	// managed edge can't work without it, so a lookup failure is fatal rather than a broken delegation.
 	publicIP, err := PublicIP(ctx)
 	if err != nil || publicIP == "" {
-		return nil, false, nil, fmt.Errorf("resolve public IP (required for the managed edge acme-dns): %w", err)
+		return WildcardResult{Outcome: WildcardOutcomeError}, fmt.Errorf("resolve public IP (required for the managed edge acme-dns): %w", err)
 	}
 	if err := WriteAcmeDnsConfig(stackRoot, ds.BaseDomain, publicIP); err != nil {
-		return nil, false, nil, err
+		return WildcardResult{Outcome: WildcardOutcomeError}, err
 	}
 	if err := Apply(ctx, dx, AcmeDnsSpec(stackRoot)); err != nil {
-		return nil, false, nil, fmt.Errorf("acme-dns: %w", err)
+		return WildcardResult{Outcome: WildcardOutcomeError}, fmt.Errorf("acme-dns: %w", err)
 	}
 	// lego registers/updates records over acme-dns' HTTP API — wait for it to accept connections
 	// (it's applied here, not standing for a while as when the stack ran first), else the first
 	// registration races the container's boot and errors.
 	waitForAcmeDNS(ctx)
 
-	// Issue/renew the single wildcard. On first run this returns the one-time delegation to surface.
-	var delegation *cloudapi.AcmeChallengeDelegation
-	if certNeedsIssue(stackRoot, ds.BaseDomain) {
-		acmeEmail := ""
-		if ds.Components.Edge != nil {
-			acmeEmail = ds.Components.Edge.AcmeEmail
-		}
-		del, issued, err := IssueWildcard(ds.BaseDomain, acmeEmail, AcmeDNSAPIBase(), stackRoot, publicIP, ds.AcmeStaging)
-		if err != nil {
-			return nil, false, nil, err
-		}
-		if !issued {
-			delegation = del // waiting on the operator's DNS before LE can validate
+	base := ds.BaseDomain
+	certs := readCerts(stackRoot, []cloudapi.DomainRoute{{Host: base}})
+
+	// Already have a valid, non-expiring wildcard — nothing to do.
+	if !certNeedsIssue(stackRoot, base) {
+		return WildcardResult{Outcome: WildcardOutcomeIssued, Certs: certs}, nil
+	}
+
+	// Recover the known CNAME target (from a prior in-memory delegation or acme-dns' persisted storage),
+	// so we can pre-flight the delegation and keep surfacing the records across restarts.
+	target := ""
+	if prev != nil {
+		target = prev.Target
+	}
+	if target == "" {
+		if t, ok := acmeDNSTarget(stackRoot); ok {
+			target = t
 		}
 	}
-	return delegation, hasCert(stackRoot, ds.BaseDomain), readCerts(stackRoot, []cloudapi.DomainRoute{{Host: ds.BaseDomain}}), nil
+	haveAccount := target != ""
+
+	del := prev
+	if del == nil && haveAccount {
+		del = delegationFor(base, target, publicIP)
+	}
+
+	// Once the acme-dns account exists, gate the LE call on the delegation actually being live.
+	if haveAccount {
+		if ready, reason := dnsDelegationReady(ctx, base, publicIP, target); !ready {
+			return WildcardResult{Delegation: del, Outcome: WildcardOutcomeAwaitingDNS, Certs: certs},
+				fmt.Errorf("dns delegation not ready: %s", reason)
+		}
+	}
+
+	// The only place we hit Let's Encrypt: either the first attempt (registers the account + surfaces
+	// the one-time CNAME) or a pre-flight-confirmed retry.
+	acmeEmail := ""
+	if ds.Components.Edge != nil {
+		acmeEmail = ds.Components.Edge.AcmeEmail
+	}
+	newDel, issued, err := IssueWildcard(base, acmeEmail, AcmeDNSAPIBase(), stackRoot, publicIP, ds.AcmeStaging)
+	if err != nil {
+		switch {
+		case IsRateLimitError(err):
+			return WildcardResult{Delegation: del, Outcome: WildcardOutcomeRateLimited, Certs: certs}, err
+		case IsDNSPropagationError(err):
+			if del == nil {
+				if t, ok := acmeDNSTarget(stackRoot); ok {
+					del = delegationFor(base, t, publicIP)
+				}
+			}
+			return WildcardResult{Delegation: del, Outcome: WildcardOutcomeAwaitingDNS, Certs: certs}, err
+		default:
+			return WildcardResult{Delegation: del, Outcome: WildcardOutcomeError, Certs: certs}, err
+		}
+	}
+	if newDel != nil {
+		// First run: the account just registered; the one-time CNAME must be added before LE can validate.
+		return WildcardResult{Delegation: newDel, Outcome: WildcardOutcomeAwaitingDNS, Certs: certs}, nil
+	}
+	if issued {
+		return WildcardResult{Outcome: WildcardOutcomeIssued, Certs: readCerts(stackRoot, []cloudapi.DomainRoute{{Host: base}})}, nil
+	}
+	// Defensive: no cert and no delegation — treat as still awaiting so we re-check rather than error.
+	return WildcardResult{Delegation: del, Outcome: WildcardOutcomeAwaitingDNS, Certs: certs}, nil
 }
 
 // EnsureNginx renders the edge config off the issued wildcard (routing derived from the base domain),

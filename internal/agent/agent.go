@@ -44,6 +44,16 @@ const secretProviderPrefix = "secretStore."
 // a generation bump (cert renewal is handled inside reconcile's EnsureWildcard).
 const resyncInterval = 5 * time.Minute
 
+// Retry cadences. fastRecheckInterval drives quick self-heal while Blocked on an operator action (DNS
+// delegation or secret store) — the checks are cheap, so a ~10s re-check lands the stack within seconds
+// of the records/config appearing. backoffBase→backoffCap is the exponential backoff after a genuine
+// reconcile failure or a Let's Encrypt rate-limit, so we never hammer LE or a failing dependency.
+const (
+	fastRecheckInterval = 10 * time.Second
+	backoffBase         = 30 * time.Second
+	backoffCap          = 30 * time.Minute
+)
+
 // Agent holds the long-lived collaborators for one deployment.
 type Agent struct {
 	cfg        *config.Config
@@ -68,9 +78,23 @@ type Agent struct {
 	lastResync          time.Time // last full-reconcile time (periodic resync cadence)
 	lastErrMsg          string    // dedup: only emit a ReconcileError event when the message changes
 	awaitingSecretStore bool      // blocked: cloud hasn't configured the secret store yet (operator action)
-	issuingWildcard     bool      // an IssuingWildcard event was emitted while awaiting the cert
-	hadCert             bool      // a wildcard cert has been observed on disk (emit CertIssued on 0→1)
+	awaitingDns         bool      // blocked: the wildcard DNS delegation isn't live yet (operator action)
+	rateLimited         bool      // blocked: Let's Encrypt rate-limited us; serving out a backoff window
+	hadCert             bool      // a wildcard cert has been observed on disk (emit WildcardIssued on 0→1)
 	giteaProvisioned    bool      // the Gitea admin token has been provisioned (emit on transition)
+
+	// Retry state. blocked = on the fast-recheck cadence (awaiting an operator action). backoff/nextAttempt
+	// throttle retries after a genuine failure / LE rate-limit. curBlockReason dedups the edge block warn,
+	// and emittedSteps dedups progress steps to once per generation so steady-state ticks stay quiet.
+	blocked        bool
+	backoff        time.Duration
+	nextAttempt    time.Time
+	curBlockReason string
+	emittedSteps   map[string]int64
+	// forceRecheckCh is a "check now" nudge (a future cloud action can call forceRecheck) that clears the
+	// backoff window and reconciles immediately; wired here but not yet triggered from anywhere.
+	forceRecheckCh chan struct{}
+
 	// pendingEvents buffers notable transitions until the next heartbeat drains them.
 	pendingEvents []cloudapi.Event
 }
@@ -95,7 +119,19 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 	}
 	cloud := cloudapi.New(cfg.CloudAPIURL, cfg.DeploymentID, keys)
 
-	return &Agent{cfg: cfg, log: log, keys: keys, machine: machine, dx: dx, cloud: cloud}, nil
+	return &Agent{
+		cfg: cfg, log: log, keys: keys, machine: machine, dx: dx, cloud: cloud,
+		forceRecheckCh: make(chan struct{}, 1),
+	}, nil
+}
+
+// forceRecheck clears any backoff window and requests an immediate reconcile. Wired for a future cloud
+// "check now" nudge (e.g. after the operator confirms the DNS records); not yet called from anywhere.
+func (a *Agent) forceRecheck() {
+	select {
+	case a.forceRecheckCh <- struct{}{}:
+	default: // a recheck is already queued
+	}
 }
 
 // Run enrolls (once) then loops: poll desired-state, reconcile, report — until ctx is cancelled.
@@ -110,6 +146,12 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	ticker := time.NewTicker(a.cfg.PollInterval)
 	defer ticker.Stop()
+
+	// Fast-recheck ticker: only drives a tick while Blocked on an operator action (DNS delegation or
+	// secret store), so the stack self-heals within ~10s of the records/config landing instead of
+	// waiting a full poll interval. Idle otherwise (the guard makes it a no-op when not blocked).
+	fastTicker := time.NewTicker(fastRecheckInterval)
+	defer fastTicker.Stop()
 
 	// Backup schedule (only fires when the pgBackRest add-on is enabled): hourly incremental,
 	// with a full every 24th tick (daily). The initial full is taken at enable time in reconcile.
@@ -126,6 +168,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			a.tick(ctx)
+		case <-fastTicker.C:
+			if a.blocked {
+				a.tick(ctx)
+			}
+		case <-a.forceRecheckCh:
+			a.nextAttempt = time.Time{} // clear any backoff window so the retry runs now
 			a.tick(ctx)
 		case <-backupTicker.C:
 			if a.archiving {
@@ -165,22 +214,72 @@ func (a *Agent) tick(ctx context.Context) {
 		return
 	}
 
-	// Generation gate: reconcile on a new generation, a lingering error, or the resync cadence.
-	if ds.Generation != a.lastGeneration || a.lastReconcileErr != nil || time.Since(a.lastResync) >= resyncInterval {
-		a.lastResync = time.Now()
+	// Generation gate: reconcile on a new generation, a lingering error, or the resync cadence — but
+	// hold off while inside a backoff window (a genuine failure / LE rate-limit) so we don't hammer.
+	now := time.Now()
+	inBackoff := a.backoff > 0 && now.Before(a.nextAttempt)
+	if !inBackoff && (ds.Generation != a.lastGeneration || a.lastReconcileErr != nil || now.Sub(a.lastResync) >= resyncInterval) {
+		a.lastResync = now
 		rerr := a.reconcile(ctx, ds)
 		a.lastReconcileErr = rerr
 		if rerr != nil {
 			a.log.Error("reconcile failed", "err", rerr)
 			a.emitError(rerr.Error())
+			a.enterBackoff() // genuine failure → exponential backoff before the next attempt
 		} else {
 			a.lastErrMsg = ""
 		}
 	}
 
+	// Blocked (fast-recheck) = awaiting an operator action. Rate-limit/errors use the backoff cadence.
+	a.blocked = a.awaitingSecretStore || a.awaitingDns
+
 	services := a.collectServices(ctx)
 	conditions := a.buildConditions(a.lastReconcileErr, services)
 	a.report(ctx, a.lastGeneration, conditions, services)
+}
+
+// enterBackoff grows the exponential backoff (base→cap) and sets the next allowed attempt time.
+func (a *Agent) enterBackoff() {
+	switch {
+	case a.backoff == 0:
+		a.backoff = backoffBase
+	default:
+		a.backoff *= 2
+		if a.backoff > backoffCap {
+			a.backoff = backoffCap
+		}
+	}
+	a.nextAttempt = time.Now().Add(a.backoff)
+}
+
+// resetBackoff clears the backoff window after a clean reconcile / successful issuance.
+func (a *Agent) resetBackoff() {
+	a.backoff = 0
+	a.nextAttempt = time.Time{}
+}
+
+// step emits an info progress event once per generation (deduped), so a new generation logs each phase
+// to the cloud timeline while steady-state resync ticks stay quiet.
+func (a *Agent) step(generation int64, component, reason, message string) {
+	if a.emittedSteps == nil {
+		a.emittedSteps = map[string]int64{}
+	}
+	if g, ok := a.emittedSteps[reason]; ok && g == generation {
+		return
+	}
+	a.emittedSteps[reason] = generation
+	a.emit("info", component, reason, message)
+}
+
+// emitBlock emits an operator-action block event once per distinct reason (deduped on curBlockReason),
+// so a steady Blocked state doesn't repeat the same warn every tick.
+func (a *Agent) emitBlock(level, component, reason, message string) {
+	if a.curBlockReason == reason {
+		return
+	}
+	a.curBlockReason = reason
+	a.emit(level, component, reason, message)
 }
 
 // nowRFC is the RFC3339 transition timestamp stamped on conditions.
@@ -195,7 +294,10 @@ func readyCondition(status, reason, message string) cloudapi.Condition {
 // health, as a strict priority ladder (error → blocked → degraded → reconciling → in-sync).
 func (a *Agent) buildConditions(reconcileErr error, services []cloudapi.ServiceStatus) []cloudapi.Condition {
 	if reconcileErr != nil {
-		return []cloudapi.Condition{readyCondition("false", "ReconcileError", reconcileErr.Error())}
+		return []cloudapi.Condition{
+			readyCondition("false", "ReconcileError", reconcileErr.Error()),
+			{Type: "Degraded", Status: "true", Reason: "ReconcileError", Message: reconcileErr.Error(), Since: nowRFC()},
+		}
 	}
 	if a.awaitingSecretStore {
 		msg := "Waiting for the secret store to be configured before provisioning."
@@ -204,7 +306,14 @@ func (a *Agent) buildConditions(reconcileErr error, services []cloudapi.ServiceS
 			{Type: "Blocked", Status: "true", Reason: "AwaitingSecretStore", Component: "secretStore", Message: msg, Since: nowRFC()},
 		}
 	}
-	if a.acmeDelegation != nil {
+	if a.rateLimited {
+		msg := "Let's Encrypt rate limit reached; backing off before retrying certificate issuance."
+		return []cloudapi.Condition{
+			readyCondition("false", "RateLimited", msg),
+			{Type: "Blocked", Status: "true", Reason: "RateLimited", Component: "edge", Message: msg, Since: nowRFC()},
+		}
+	}
+	if a.awaitingDns {
 		msg := "Add the DNS delegation records so the wildcard certificate can be issued."
 		return []cloudapi.Condition{
 			readyCondition("false", "AwaitingDnsDelegation", msg),
@@ -408,40 +517,58 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// skips this (a BYO ingress/LB fronts core, so the agent runs no nginx/acme-dns).
 	a.edgeManaged = ds.Components.Edge != nil && ds.Components.Edge.Mode == cloudapi.EdgeManaged && ds.BaseDomain != ""
 	if a.edgeManaged {
-		delegation, issued, certs, err := deploy.EnsureWildcard(ctx, a.dx, ds, a.cfg.StackRoot)
-		if err != nil {
-			return err
-		}
-		a.acmeDelegation = delegation
-		a.certs = certs
 		keep[deploy.SvcAcmeDns] = true
-		if !issued {
-			// Waiting on the operator's DNS (zone delegation + CNAME). Announce it once so the timeline
-			// shows the stack is blocked on DNS; keep acme-dns running and retry next tick; do NOT
-			// provision the app stack until the wildcard is in place.
-			if !a.issuingWildcard {
-				a.issuingWildcard = true
-				a.emit("info", "edge", "IssuingWildcard",
-					fmt.Sprintf("Issuing wildcard certificate for *.%s — add the DNS delegation records.", ds.BaseDomain))
+		// Pre-flight-guarded issuance: EnsureWildcard only calls Let's Encrypt once the delegation
+		// actually resolves (or on the very first register), so DNS propagation no longer produces a
+		// ReconcileError burst. Categorize the outcome into the right condition/event/cadence.
+		res, werr := deploy.EnsureWildcard(ctx, a.dx, ds, a.cfg.StackRoot, a.acmeDelegation)
+		a.certs = res.Certs
+		switch res.Outcome {
+		case deploy.WildcardOutcomeAwaitingDNS:
+			// Operator must add/propagate the DNS records — a steady block, not a failure. Log the step
+			// once/gen, warn once, keep acme-dns running, and re-check on the fast cadence. No error.
+			a.acmeDelegation = res.Delegation
+			a.awaitingDns, a.rateLimited = true, false
+			a.step(ds.Generation, "edge", "IssuingWildcard", fmt.Sprintf("Issuing wildcard certificate for *.%s.", ds.BaseDomain))
+			a.emitBlock("warn", "edge", "AwaitingDnsDelegation",
+				"Waiting for the DNS delegation records to propagate before the wildcard certificate can be issued.")
+			if werr != nil {
+				a.log.Warn("awaiting dns delegation", "err", werr)
 			}
 			return nil
+		case deploy.WildcardOutcomeRateLimited:
+			// LE throttled us — enter backoff and hold; not a failure, so no ReconcileError.
+			a.awaitingDns, a.rateLimited = false, true
+			a.emitBlock("warn", "edge", "RateLimited",
+				"Let's Encrypt rate limit reached; backing off before retrying certificate issuance.")
+			a.log.Warn("lets-encrypt rate limited", "err", werr)
+			a.enterBackoff()
+			return nil
+		case deploy.WildcardOutcomeError:
+			// Genuine issuance failure (account/network/LE hard error) — surface as a ReconcileError.
+			return werr
 		}
-		// Cert is in place. Announce the first issuance (0→1) on the timeline.
+		// WildcardOutcomeIssued — the wildcard is in place; clear blocks and continue provisioning.
+		a.acmeDelegation = nil
+		a.awaitingDns, a.rateLimited, a.curBlockReason = false, false, ""
+		a.resetBackoff()
 		if !a.hadCert {
 			a.hadCert = true
-			a.emit("info", "edge", "CertIssued", fmt.Sprintf("Wildcard certificate issued for *.%s.", ds.BaseDomain))
+			a.emit("info", "edge", "WildcardIssued", fmt.Sprintf("Wildcard certificate issued for *.%s.", ds.BaseDomain))
 		}
-		a.issuingWildcard = false
 	} else {
 		a.acmeDelegation = nil
 		a.certs = nil
+		a.awaitingDns, a.rateLimited, a.curBlockReason = false, false, ""
 	}
 
 	// (7) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
 	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
 	archiving := pgBackRest
 	if dbManaged {
+		a.step(ds.Generation, "database", "ProvisioningDatabase", "Provisioning the managed Postgres database.")
 		if archiving {
+			a.step(ds.Generation, "database", "EnablingBackups", "Enabling pgBackRest backups for the managed database.")
 			// Config must exist before Postgres boots so archive_command works from the first WAL.
 			// The S3-compatible OFFSITE backup creds (S3_*) live in a DEDICATED `/backup` secret-store
 			// folder — NOT `/core-server` (whose bucket is the app's media store). Best-effort: if
@@ -499,6 +626,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// (8) Render the commerce env verbatim, then run migrations (owner conn) to completion before the
 	// app services roll. core-migrate runs without the Gitea additions (they aren't needed for DDL).
 	commerceEnvSlice := deploy.RenderServiceEnv(commerceEnv)
+	a.step(ds.Generation, "core", "RunningMigrations", "Running database migrations.")
 	if err := a.migrate(ctx, ds, deploy.RenderCoreEnv(coreEnv, "", ""), commerceEnvSlice); err != nil {
 		return err
 	}
@@ -514,6 +642,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// core boots already knowing GITEA_BASE_URL + GITEA_ADMIN_TOKEN and can create the app user + PAT.
 	giteaURL, giteaToken := "", ""
 	if giteaEnabled {
+		a.step(ds.Generation, "gitea", "ProvisioningGitea", "Provisioning the Gitea add-on.")
 		// gitea runs as uid 1000 and writes its bind-mounted /data — hand ownership over, else it
 		// crashes reading /data/gitea/conf/app.ini with "permission denied" on the root-owned mount.
 		if err := os.Chown(deploy.GiteaDataDir(a.cfg.StackRoot), deploy.GiteaUID, deploy.GiteaUID); err != nil {
@@ -546,6 +675,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	coreEnvSlice := deploy.RenderCoreEnv(coreEnv, giteaURL, giteaToken)
 	longRunning = append(longRunning, deploy.CoreServerSpec(ds, coreEnvSlice, a.cfg.StackRoot))
 
+	a.step(ds.Generation, "core", "StartingServices", "Starting the core services (redis, nats, commerce, core-server).")
 	for _, spec := range longRunning {
 		if err := deploy.Apply(ctx, a.dx, spec); err != nil {
 			return fmt.Errorf("%s: %w", spec.Name, err)
@@ -571,6 +701,10 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 		return err
 	}
 
+	// Fully converged: clear any lingering block/backoff state and log completion once per generation.
+	a.curBlockReason = ""
+	a.resetBackoff()
+	a.step(ds.Generation, "core", "ReconcileComplete", "All components reconciled and in sync.")
 	a.lastGeneration = ds.Generation
 	return nil
 }

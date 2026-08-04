@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -150,6 +151,166 @@ func PublicIP(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+// WildcardOutcome categorizes an EnsureWildcard attempt so the agent can pick the right condition,
+// event, and retry cadence WITHOUT treating an operator/DNS/LE-throttle state as a hard failure.
+type WildcardOutcome int
+
+const (
+	// WildcardOutcomeIssued — a usable wildcard cert is on disk (freshly issued or still valid).
+	WildcardOutcomeIssued WildcardOutcome = iota
+	// WildcardOutcomeAwaitingDNS — the delegation isn't live yet (pre-flight false or a lego
+	// propagation timeout). Not a failure: surface the records + re-check on the fast cadence.
+	WildcardOutcomeAwaitingDNS
+	// WildcardOutcomeRateLimited — Let's Encrypt returned a rate-limit error; back off before retrying.
+	WildcardOutcomeRateLimited
+	// WildcardOutcomeError — a genuine failure (account/network/LE hard error) worth surfacing as an error.
+	WildcardOutcomeError
+)
+
+// WildcardResult is the categorized outcome of one EnsureWildcard attempt.
+type WildcardResult struct {
+	Delegation *cloudapi.AcmeChallengeDelegation // one-time DNS records to add (nil once issued)
+	Outcome    WildcardOutcome
+	Certs      []cloudapi.CertReport // current on-disk cert inventory (reported every heartbeat)
+}
+
+// IsDNSPropagationError reports whether a lego error is the DNS-01 propagation/CNAME self-check
+// timeout (records not yet live) rather than a genuine issuance failure — string-matched as a
+// fallback because lego wraps it as a plain error.
+func IsDNSPropagationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "propagation") || strings.Contains(s, "did not return the expected txt")
+}
+
+// IsRateLimitError reports whether a lego/LE error is a rate-limit (HTTP 429 / acme rateLimited),
+// so the agent can back off instead of hammering Let's Encrypt.
+func IsRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "ratelimited") || strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "too many") || strings.Contains(s, "429")
+}
+
+// acmeDNSTarget reads the acme-dns account subdomain (its `fulldomain` == the CNAME target
+// `<uuid>.acme.<base>`) from lego's persisted storage, so the pre-flight + delegation survive an
+// agent restart (one deployment = one acme-dns account, so any entry's fulldomain is ours).
+func acmeDNSTarget(stackRoot string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(stackRoot, leDir, "acmedns.json"))
+	if err != nil {
+		return "", false
+	}
+	var accounts map[string]struct {
+		FullDomain string `json:"fulldomain"`
+	}
+	if err := json.Unmarshal(data, &accounts); err != nil {
+		return "", false
+	}
+	for _, acct := range accounts {
+		if acct.FullDomain != "" {
+			return acct.FullDomain, true
+		}
+	}
+	return "", false
+}
+
+// delegationFor rebuilds the one-time DNS-delegation records from known values (used when we know the
+// CNAME target from storage/a prior attempt, so we can keep surfacing the records without another LE call).
+func delegationFor(baseDomain, target, publicIP string) *cloudapi.AcmeChallengeDelegation {
+	return &cloudapi.AcmeChallengeDelegation{
+		Name:       "_acme-challenge." + baseDomain,
+		Target:     target,
+		Zone:       acmeDNSZone(baseDomain),
+		Nameserver: acmeDNSNameserver(baseDomain),
+		ServerIP:   publicIP,
+	}
+}
+
+// resolverFor builds a stub resolver that always dials the given public DNS server, bypassing the VM's
+// (possibly stale-caching) resolver — the same reason lego's propagation self-check uses these servers.
+func resolverFor(server string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "udp", server)
+		},
+	}
+}
+
+// anyPublicResolver returns true as soon as one public resolver confirms the check (tolerates a single
+// resolver lagging during propagation — LE validates via its own resolvers regardless).
+func anyPublicResolver(check func(*net.Resolver) bool) bool {
+	for _, server := range publicDNSResolvers {
+		if check(resolverFor(server)) {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsDelegationReady verifies, via the public resolvers, that the operator's three delegation records
+// are actually live BEFORE we ask Let's Encrypt to validate — this is what stops the repeated ~2-minute
+// "propagation: time limit exceeded" bursts (and the LE order/validation churn) during propagation:
+//
+//  1. ns.<base>            A     == the VM public IP,
+//  2. acme.<base>          NS    contains ns.<base>,
+//  3. _acme-challenge.<base> CNAME → <uuid>.acme.<base>  (skipped when the target isn't known yet).
+//
+// Returns (false, reason) with a human reason naming the missing record.
+func dnsDelegationReady(ctx context.Context, baseDomain, publicIP, target string) (bool, string) {
+	ns := acmeDNSNameserver(baseDomain) // ns.<base>
+	zone := acmeDNSZone(baseDomain)     // acme.<base>
+	challenge := "_acme-challenge." + baseDomain
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+
+	if !anyPublicResolver(func(r *net.Resolver) bool {
+		addrs, err := r.LookupHost(lookupCtx, ns)
+		return err == nil && contains(addrs, publicIP)
+	}) {
+		return false, fmt.Sprintf("%s A record does not resolve to %s yet", ns, publicIP)
+	}
+
+	if !anyPublicResolver(func(r *net.Resolver) bool {
+		records, err := r.LookupNS(lookupCtx, zone)
+		if err != nil {
+			return false
+		}
+		for _, rec := range records {
+			if strings.EqualFold(strings.TrimSuffix(rec.Host, "."), ns) {
+				return true
+			}
+		}
+		return false
+	}) {
+		return false, fmt.Sprintf("%s NS delegation to %s not present yet", zone, ns)
+	}
+
+	if target != "" && !anyPublicResolver(func(r *net.Resolver) bool {
+		cname, err := r.LookupCNAME(lookupCtx, challenge)
+		return err == nil && strings.EqualFold(strings.TrimSuffix(cname, "."), strings.TrimSuffix(target, "."))
+	}) {
+		return false, fmt.Sprintf("%s CNAME to %s not present yet", challenge, target)
+	}
+
+	return true, ""
+}
+
+// contains reports whether s is in list.
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // certNeedsIssue reports whether the wildcard needs (re)issuing — missing or within the renew window.
