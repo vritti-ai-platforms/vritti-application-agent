@@ -245,7 +245,8 @@ func NginxSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
 		Restart:  true,
 		MemLimit: 96 * mib,
 		Health: &dockerx.HealthSpec{
-			Test:     []string{"CMD", "wget", "-q", "--spider", "http://localhost/healthz"},
+			// The nginx image is Debian-based (has curl, no wget/busybox); curl -f fails on non-2xx.
+			Test:     []string{"CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost/healthz"},
 			Interval: 10 * time.Second,
 			Timeout:  5 * time.Second,
 			Retries:  5,

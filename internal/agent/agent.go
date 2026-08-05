@@ -701,6 +701,15 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 		if !a.hadCert {
 			a.hadCert = true
 			a.emit("info", "edge", "WildcardIssued", fmt.Sprintf("Wildcard certificate issued for *.%s.", ds.BaseDomain))
+			// Push an interim heartbeat now: provisioning (steps 7-11 below) runs synchronously in this same
+			// reconcile pass and would otherwise report only on completion — stranding the setup wizard on the
+			// DNS step for the entire provisioning window, then jumping straight to Sync. Reporting cert-in-place
+			// + Reconciling here advances the wizard to Provision the moment the wildcard exists. First issuance
+			// only (gated on !hadCert), so steady-state reconciles don't flicker Provisioning→Ready.
+			a.report(ctx, ds.Generation, []cloudapi.Condition{
+				readyCondition("false", "Reconciling", "Wildcard certificate issued; provisioning the stack."),
+				{Type: "Reconciling", Status: "true", Reason: "Provisioning", Component: "edge", Message: "Wildcard certificate issued; provisioning the stack.", Since: nowRFC()},
+			}, a.collectServices(ctx))
 		}
 	} else {
 		a.acmeDelegation = nil
