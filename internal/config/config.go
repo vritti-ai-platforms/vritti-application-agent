@@ -8,17 +8,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 // Config is the agent's boot configuration.
 type Config struct {
-	CloudAPIURL  string        // agent API base, e.g. https://api.vrittiai.com
-	DeploymentID string        // the deployment this agent serves
-	EnrollToken  string        // one-time token from admin (burned after first enroll)
-	DataDir      string        // agent state root (keys, secrets, enrollment)
-	StackRoot    string        // host path for bind mounts (/opt/vritti-core)
-	PollInterval time.Duration // desired-state poll cadence
+	CloudAPIURL  string // agent API base, e.g. https://api.vrittiai.com
+	DeploymentID string // the deployment this agent serves
+	EnrollToken  string // one-time token from admin (burned after first enroll)
+	DataDir      string // agent state root (keys, secrets, enrollment)
+	StackRoot    string // host path for bind mounts (/opt/vritti-core)
 }
 
 // Load reads configuration from the environment, applying sane defaults.
@@ -29,7 +27,6 @@ func Load() (*Config, error) {
 		EnrollToken:  os.Getenv("VRITTI_ENROLL_TOKEN"),
 		DataDir:      envOr("VRITTI_DATA_DIR", "/var/lib/vritti-agent"),
 		StackRoot:    envOr("VRITTI_STACK_ROOT", "/opt/vritti-core"),
-		PollInterval: 20 * time.Second,
 	}
 	if c.CloudAPIURL == "" {
 		return nil, fmt.Errorf("VRITTI_CLOUD_API_URL is required")

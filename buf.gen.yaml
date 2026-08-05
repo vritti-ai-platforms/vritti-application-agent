@@ -1,0 +1,16 @@
+# Codegen config. Managed mode stamps the go_package prefix so generated Go lands under gen/agent/v1.
+# Plugins are built from already-required modules into .bin by scripts/gen-proto.sh, then invoked
+# locally by buf — no global installs, no buf in go.mod (buf runs via a pinned `go run @version`).
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/vritti-ai-platforms/vritti-application-agent/gen
+plugins:
+  - local: protoc-gen-go
+    out: gen
+    opt: paths=source_relative
+  - local: protoc-gen-connect-go
+    out: gen
+    opt: paths=source_relative

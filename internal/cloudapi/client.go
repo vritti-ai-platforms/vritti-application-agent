@@ -1,15 +1,16 @@
 package cloudapi
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"connectrpc.com/connect"
+	agentv1 "github.com/vritti-ai-platforms/vritti-application-agent/gen/agent/v1"
+	"github.com/vritti-ai-platforms/vritti-application-agent/gen/agent/v1/agentv1connect"
 )
 
 // Signer produces a base64 Ed25519 signature over a message (the agent's signing key).
@@ -18,121 +19,244 @@ type Signer interface {
 	SigningPublicB64() string
 }
 
-// Client is a signed HTTP client to cloud-server. Every authenticated request carries the
-// agent credential plus an Ed25519 signature over the body, so cloud can verify both that
-// the request came from this enrolled agent and that the body was not tampered with.
+// Client is a Connect (gRPC-compatible) client to cloud-server. Every call carries the agent credential
+// plus an Ed25519 signature over `<unix-seconds>.<deploymentId>` as request metadata, so cloud can verify
+// both that the request came from this enrolled agent and that it is fresh (replay window). Server-streaming
+// (Subscribe) rides HTTP/1.1, so it works through Cloudflare (which does not reliably proxy raw gRPC bidi).
 type Client struct {
-	baseURL      string
 	deploymentID string
-	http         *http.Client
 	signer       Signer
+	svc          agentv1connect.AgentServiceClient
 
-	credential string // set after enroll
+	credential string // set after enroll, read by the auth interceptor on every subsequent call
 }
 
-// New builds a cloud client for one deployment.
+// New builds a cloud client for one deployment. No client-level timeout — the Subscribe stream is
+// long-lived; unary calls carry their own context deadlines.
 func New(baseURL, deploymentID string, signer Signer) *Client {
-	return &Client{
-		baseURL:      strings.TrimRight(baseURL, "/"),
-		deploymentID: deploymentID,
-		signer:       signer,
-		http:         &http.Client{Timeout: 30 * time.Second},
-	}
+	c := &Client{deploymentID: deploymentID, signer: signer}
+	c.svc = agentv1connect.NewAgentServiceClient(
+		http.DefaultClient,
+		strings.TrimRight(baseURL, "/"),
+		connect.WithInterceptors(&authInterceptor{c: c}),
+	)
+	return c
 }
 
 // SetCredential installs the bearer credential returned from enrollment.
 func (c *Client) SetCredential(cred string) { c.credential = cred }
 
-// Enroll performs the one-time enrollment handshake and returns the deployment public key
-// plus the connectivity nonce/signature for the caller to verify.
+// Enroll performs the one-time enrollment handshake and returns the deployment public key plus the
+// connectivity nonce/signature for the caller to verify.
 func (c *Client) Enroll(ctx context.Context, token, agentVersion string) (*EnrollResponse, error) {
-	body := EnrollRequest{
-		DeploymentID:  c.deploymentID,
-		EnrollToken:   token,
-		SigningPubKey: c.signer.SigningPublicB64(),
-		AgentVersion:  agentVersion,
-	}
-	// SealingPubKey is filled by the caller-provided signer type if available; kept explicit below.
-	var resp EnrollResponse
-	if err := c.do(ctx, http.MethodPost, "/agent/enroll", body, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
+	return c.enroll(ctx, token, "", agentVersion)
 }
 
 // EnrollWithSealing is like Enroll but also registers the agent's sealing public key.
 func (c *Client) EnrollWithSealing(ctx context.Context, token, sealingPub, agentVersion string) (*EnrollResponse, error) {
-	body := EnrollRequest{
-		DeploymentID:  c.deploymentID,
+	return c.enroll(ctx, token, sealingPub, agentVersion)
+}
+
+func (c *Client) enroll(ctx context.Context, token, sealingPub, agentVersion string) (*EnrollResponse, error) {
+	resp, err := c.svc.Enroll(ctx, connect.NewRequest(&agentv1.EnrollRequest{
+		DeploymentId:  c.deploymentID,
 		EnrollToken:   token,
 		SigningPubKey: c.signer.SigningPublicB64(),
 		SealingPubKey: sealingPub,
 		AgentVersion:  agentVersion,
-	}
-	var resp EnrollResponse
-	if err := c.do(ctx, http.MethodPost, "/agent/enroll", body, &resp); err != nil {
+	}))
+	if err != nil {
 		return nil, err
 	}
-	return &resp, nil
+	return &EnrollResponse{
+		AgentCredential:  resp.Msg.AgentCredential,
+		DeploymentPubKey: resp.Msg.DeploymentPubKey,
+		Nonce:            resp.Msg.Nonce,
+		NonceSignature:   resp.Msg.NonceSignature,
+	}, nil
 }
 
-// FetchDesiredState pulls the current signed desired-state for this deployment.
-func (c *Client) FetchDesiredState(ctx context.Context) (*SignedDesiredState, error) {
-	var resp SignedDesiredState
-	path := fmt.Sprintf("/agent/deployments/%s/desired-state", c.deploymentID)
-	if err := c.do(ctx, http.MethodGet, path, nil, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-// ReportStatus pushes a heartbeat with container states and lifecycle phase.
+// ReportStatus pushes a heartbeat with conditions, per-service state, host metrics, certs, and events.
 func (c *Client) ReportStatus(ctx context.Context, report StatusReport) error {
-	path := fmt.Sprintf("/agent/deployments/%s/status", c.deploymentID)
-	return c.do(ctx, http.MethodPost, path, report, nil)
+	_, err := c.svc.ReportStatus(ctx, connect.NewRequest(toProtoStatusReport(report)))
+	return err
 }
 
-// do issues a signed JSON request and decodes the JSON response into out (may be nil).
-func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
-	var payload []byte
-	if in != nil {
-		b, err := json.Marshal(in)
-		if err != nil {
-			return err
+// LogSender is an open StreamLogs client-stream for pushing tailed container log lines up to cloud.
+type LogSender struct {
+	stream *connect.ClientStreamForClient[agentv1.LogLine, agentv1.StreamLogsAck]
+}
+
+// OpenLogStream opens the StreamLogs client-stream. Push lines with Send, then Close when the tail stops.
+func (c *Client) OpenLogStream(ctx context.Context) *LogSender {
+	return &LogSender{stream: c.svc.StreamLogs(ctx)}
+}
+
+// Send pushes one tailed log line (tagged with the container target it came from).
+func (s *LogSender) Send(target, stream, ts, line string) error {
+	return s.stream.Send(&agentv1.LogLine{Target: target, Stream: stream, Ts: ts, Line: line})
+}
+
+// Close half-closes the stream and waits for the cloud ack.
+func (s *LogSender) Close() error {
+	_, err := s.stream.CloseAndReceive()
+	return err
+}
+
+// Subscribe opens the cloud->agent push stream. Cloud immediately sends the current signed desired-state,
+// then a new one on every generation bump (or a Command / KeepAlive). knownGeneration lets cloud skip an
+// immediate re-push when the agent is already current.
+func (c *Client) Subscribe(ctx context.Context, knownGeneration int64) (*Subscription, error) {
+	stream, err := c.svc.Subscribe(ctx, connect.NewRequest(&agentv1.SubscribeRequest{
+		DeploymentId:    c.deploymentID,
+		KnownGeneration: knownGeneration,
+	}))
+	if err != nil {
+		return nil, err
+	}
+	return &Subscription{stream: stream}, nil
+}
+
+// Subscription is an open Subscribe server-stream. Call Receive until it returns a non-nil error.
+type Subscription struct {
+	stream *connect.ServerStreamForClient[agentv1.ServerMessage]
+}
+
+// ServerEvent is one decoded frame from the Subscribe stream — exactly one field is set.
+type ServerEvent struct {
+	DesiredState *SignedDesiredState // a desired-state push (verify + reconcile)
+	Command      *Command            // an out-of-band instruction (force recheck, start/stop logs)
+	KeepAlive    bool                // liveness frame only (keeps the CF-proxied stream from idling out)
+}
+
+// Command mirrors the agent-actionable subset of the wire Command oneof (pushed on the Subscribe stream).
+type Command struct {
+	ForceRecheck  bool
+	RequestStatus bool
+	StartLogs     *StartLogs
+	StopLogs      *StopLogs
+}
+
+// StartLogs asks the agent to tail one container ("agent" or a service name) and stream its lines up.
+type StartLogs struct {
+	Target    string
+	TailLines int32
+	Since     string
+}
+
+// StopLogs asks the agent to stop tailing a container.
+type StopLogs struct {
+	Target string
+}
+
+// Receive blocks for the next server frame. Returns io.EOF on a clean stream close, or the stream error.
+func (s *Subscription) Receive() (*ServerEvent, error) {
+	if !s.stream.Receive() {
+		if err := s.stream.Err(); err != nil {
+			return nil, err
 		}
-		payload = b
+		return nil, io.EOF
 	}
+	switch m := s.stream.Msg().Msg.(type) {
+	case *agentv1.ServerMessage_DesiredState:
+		return &ServerEvent{DesiredState: &SignedDesiredState{
+			PayloadB64: m.DesiredState.PayloadB64,
+			Signature:  m.DesiredState.Signature,
+		}}, nil
+	case *agentv1.ServerMessage_Command:
+		return &ServerEvent{Command: mapCommand(m.Command)}, nil
+	case *agentv1.ServerMessage_KeepAlive:
+		return &ServerEvent{KeepAlive: true}, nil
+	default:
+		return &ServerEvent{}, nil
+	}
+}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(payload))
-	if err != nil {
-		return err
+// Close releases the stream.
+func (s *Subscription) Close() error { return s.stream.Close() }
+
+func mapCommand(c *agentv1.Command) *Command {
+	switch k := c.Kind.(type) {
+	case *agentv1.Command_ForceRecheck:
+		return &Command{ForceRecheck: true}
+	case *agentv1.Command_RequestStatus:
+		return &Command{RequestStatus: true}
+	case *agentv1.Command_StartLogs:
+		return &Command{StartLogs: &StartLogs{Target: k.StartLogs.Target, TailLines: k.StartLogs.TailLines, Since: k.StartLogs.Since}}
+	case *agentv1.Command_StopLogs:
+		return &Command{StopLogs: &StopLogs{Target: k.StopLogs.Target}}
+	default:
+		return &Command{}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Vritti-Deployment", c.deploymentID)
-	if c.credential != "" {
-		req.Header.Set("Authorization", "Bearer "+c.credential)
+}
+
+// toProtoStatusReport maps the internal StatusReport to its proto wire form (none of it is content-signed).
+func toProtoStatusReport(r StatusReport) *agentv1.StatusReport {
+	out := &agentv1.StatusReport{DeploymentId: r.DeploymentID, Generation: r.Generation}
+	for _, c := range r.Conditions {
+		out.Conditions = append(out.Conditions, &agentv1.Condition{
+			Type: c.Type, Status: c.Status, Reason: c.Reason, Message: c.Message, Component: c.Component, Since: c.Since,
+		})
 	}
-	// Sign `<unix-seconds>.<body>` so the signature is fresh even for empty-body GETs (a bare body
-	// signature is a static replayable value). Cloud rejects a stale/absent timestamp. The signed
-	// message MUST match the guard exactly: timestamp, a literal '.', then the raw request body.
+	for _, s := range r.Services {
+		out.Services = append(out.Services, &agentv1.ServiceStatus{
+			Component: s.Component, Service: s.Service, Name: s.Name, State: s.State, Health: s.Health,
+			CpuPercent: s.CPUPercent, MemoryBytes: s.MemoryBytes,
+		})
+	}
+	if r.Host != nil {
+		out.Host = &agentv1.HostMetrics{
+			CpuPercent: r.Host.CPUPercent, MemTotalBytes: r.Host.MemTotalBytes, MemUsedBytes: r.Host.MemUsedBytes,
+			DiskTotalBytes: r.Host.DiskTotalBytes, DiskUsedBytes: r.Host.DiskUsedBytes,
+		}
+	}
+	for _, c := range r.Certificates {
+		out.Certificates = append(out.Certificates, &agentv1.CertReport{Host: c.Host, NotAfter: c.NotAfter, IssuedAt: c.IssuedAt})
+	}
+	if r.Delegation != nil {
+		out.Delegation = &agentv1.AcmeChallengeDelegation{
+			Name: r.Delegation.Name, Target: r.Delegation.Target, Zone: r.Delegation.Zone,
+			Nameserver: r.Delegation.Nameserver, ServerIp: r.Delegation.ServerIP,
+		}
+	}
+	for _, e := range r.Events {
+		out.Events = append(out.Events, &agentv1.Event{Level: e.Level, Component: e.Component, Reason: e.Reason, Message: e.Message})
+	}
+	return out
+}
+
+// authInterceptor attaches the 5 agent auth headers (signing `<ts>.<deploymentId>`) to every unary call
+// and to the Subscribe stream open, mirroring the cloud-server Connect auth interceptor.
+type authInterceptor struct{ c *Client }
+
+func (a *authInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		a.setAuthHeaders(req.Header())
+		return next(ctx, req)
+	}
+}
+
+func (a *authInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		conn := next(ctx, spec)
+		a.setAuthHeaders(conn.RequestHeader())
+		return conn
+	}
+}
+
+// WrapStreamingHandler is a no-op — this interceptor is client-side only.
+func (a *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return next
+}
+
+func (a *authInterceptor) setAuthHeaders(h http.Header) {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	signed := append([]byte(ts+"."), payload...)
-	req.Header.Set("X-Vritti-Agent-Key", c.signer.SigningPublicB64())
-	req.Header.Set("X-Vritti-Timestamp", ts)
-	req.Header.Set("X-Vritti-Signature", c.signer.Sign(signed))
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
+	signed := ts + "." + a.c.deploymentID
+	h.Set("X-Vritti-Deployment", a.c.deploymentID)
+	h.Set("X-Vritti-Agent-Key", a.c.signer.SigningPublicB64())
+	h.Set("X-Vritti-Timestamp", ts)
+	h.Set("X-Vritti-Signature", a.c.signer.Sign([]byte(signed)))
+	if a.c.credential != "" {
+		h.Set("Authorization", "Bearer "+a.c.credential)
 	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("cloud %s %s: %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-	if out != nil && len(respBody) > 0 {
-		return json.Unmarshal(respBody, out)
-	}
-	return nil
 }

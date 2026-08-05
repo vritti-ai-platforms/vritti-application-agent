@@ -52,6 +52,14 @@ const (
 	fastRecheckInterval = 10 * time.Second
 	backoffBase         = 30 * time.Second
 	backoffCap          = 30 * time.Minute
+
+	// heartbeatInterval is the periodic status-push cadence when nothing changes — it gives cloud and the
+	// setup UI steady liveness/health even with no reconcile (transitions still report immediately, out of band).
+	heartbeatInterval = 30 * time.Second
+	// reconnectBackoff{Base,Cap} throttle re-opening the Subscribe stream after it drops (network blip, a
+	// Cloudflare idle close, or a cloud restart) so we don't hammer on a persistent outage.
+	reconnectBackoffBase = 2 * time.Second
+	reconnectBackoffCap  = 1 * time.Minute
 )
 
 // Agent holds the long-lived collaborators for one deployment.
@@ -63,12 +71,14 @@ type Agent struct {
 	dx         *dockerx.Client
 	cloud      *cloudapi.Client
 	enrollment *cloudapi.Enrollment
+	logs       *logManager // on-demand container log tailing (StartLogs/StopLogs)
 
 	lastGeneration int64
-	archiving      bool                  // pgBackRest add-on currently enabled (drives the backup ticker)
-	hadFullBackup  bool                  // a full backup has been taken since archiving was enabled
-	edgeManaged    bool                  // agent runs nginx + the bundled acme-dns wildcard edge
-	certs          []cloudapi.CertReport // last observed managed-edge certs (reported each heartbeat)
+	lastDesired    *cloudapi.DesiredState // last verified desired-state — re-applied on force-recheck / blocked self-heal
+	archiving      bool                   // pgBackRest add-on currently enabled (drives the backup ticker)
+	hadFullBackup  bool                   // a full backup has been taken since archiving was enabled
+	edgeManaged    bool                   // agent runs nginx + the bundled acme-dns wildcard edge
+	certs          []cloudapi.CertReport  // last observed managed-edge certs (reported each heartbeat)
 	// acmeDelegation, when set, is the one-time CNAME the operator must add before the wildcard cert
 	// can issue — surfaced in the heartbeat for the setup flow's DNS-Delegation step.
 	acmeDelegation *cloudapi.AcmeChallengeDelegation
@@ -91,8 +101,8 @@ type Agent struct {
 	nextAttempt    time.Time
 	curBlockReason string
 	emittedSteps   map[string]int64
-	// forceRecheckCh is a "check now" nudge (a future cloud action can call forceRecheck) that clears the
-	// backoff window and reconciles immediately; wired here but not yet triggered from anywhere.
+	// forceRecheckCh is a "check now" nudge (driven by the cloud ForceRecheck command over the Subscribe
+	// stream) that clears the backoff window and re-applies the last desired-state immediately.
 	forceRecheckCh chan struct{}
 
 	// pendingEvents buffers notable transitions until the next heartbeat drains them.
@@ -125,8 +135,8 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 	}, nil
 }
 
-// forceRecheck clears any backoff window and requests an immediate reconcile. Wired for a future cloud
-// "check now" nudge (e.g. after the operator confirms the DNS records); not yet called from anywhere.
+// forceRecheck requests an immediate re-apply of the last desired-state on the next select iteration
+// (the handler clears the backoff window first). Driven by the cloud ForceRecheck command over the stream.
 func (a *Agent) forceRecheck() {
 	select {
 	case a.forceRecheckCh <- struct{}{}:
@@ -134,7 +144,15 @@ func (a *Agent) forceRecheck() {
 	}
 }
 
-// Run enrolls (once) then loops: poll desired-state, reconcile, report — until ctx is cancelled.
+// streamMsg carries one Subscribe frame (or the terminal stream error) from the reader goroutine.
+type streamMsg struct {
+	event *cloudapi.ServerEvent
+	err   error
+}
+
+// Run enrolls (once) then holds a live Subscribe stream: it applies each pushed desired-state, reports
+// status on transitions plus a periodic heartbeat, self-heals while blocked, runs scheduled backups, and
+// reconnects with backoff when the stream drops — until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
 	enr, err := enroll.Run(ctx, a.cloud, a.keys, a.cfg, Version)
 	if err != nil {
@@ -142,69 +160,156 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.enrollment = enr
 	a.cloud.SetCredential(enr.AgentCredential)
+	a.logs = newLogManager(ctx, a.dx, a.cloud, a.log)
 	a.log.Info("enrolled", "deployment", a.cfg.DeploymentID)
 
-	ticker := time.NewTicker(a.cfg.PollInterval)
-	defer ticker.Stop()
-
-	// Fast-recheck ticker: only drives a tick while Blocked on an operator action (DNS delegation or
-	// secret store), so the stack self-heals within ~10s of the records/config landing instead of
-	// waiting a full poll interval. Idle otherwise (the guard makes it a no-op when not blocked).
+	// Periodic status heartbeat (liveness/health) independent of desired-state changes.
+	heartbeatTicker := time.NewTicker(heartbeatInterval)
+	defer heartbeatTicker.Stop()
+	// Periodic re-apply of the last desired-state (in memory) — drives cert renewal (reconcile's
+	// EnsureWildcard) even when the generation is unchanged. New desired-state arrives via the Subscribe
+	// push (and a reconnect re-delivers the current state), so no separate fetch is needed.
+	resyncTicker := time.NewTicker(resyncInterval)
+	defer resyncTicker.Stop()
+	// Fast-recheck only fires while Blocked on an operator action (DNS delegation / secret store) so the
+	// stack self-heals within ~10s of the records/config landing. Idle otherwise (guarded on a.blocked).
 	fastTicker := time.NewTicker(fastRecheckInterval)
 	defer fastTicker.Stop()
-
-	// Backup schedule (only fires when the pgBackRest add-on is enabled): hourly incremental,
-	// with a full every 24th tick (daily). The initial full is taken at enable time in reconcile.
+	// Backup schedule (only fires when the pgBackRest add-on is enabled): hourly incremental, full daily.
 	backupTicker := time.NewTicker(time.Hour)
 	defer backupTicker.Stop()
 	backupTick := 0
 
-	// Wildcard cert renewal is handled inside each reconcile (EnsureEdge reissues via lego once the
-	// cert is within its renewal window) — no separate ticker needed.
-
-	a.tick(ctx) // reconcile immediately on boot
+	// Reconnect loop: open the stream, drain it in the inner select, reopen with backoff when it drops.
+	reconnect := time.Duration(0)
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		case <-ticker.C:
-			a.tick(ctx)
-		case <-fastTicker.C:
-			if a.blocked {
-				a.tick(ctx)
+		}
+		sub, err := a.cloud.Subscribe(ctx, a.lastGeneration)
+		if err != nil {
+			a.log.Warn("subscribe failed", "err", err)
+			if !sleepBackoff(ctx, &reconnect) {
+				return nil
 			}
-		case <-a.forceRecheckCh:
-			a.nextAttempt = time.Time{} // clear any backoff window so the retry runs now
-			a.tick(ctx)
-		case <-backupTicker.C:
-			if a.archiving {
-				backupTick++
-				bt := "incr"
-				if backupTick%24 == 0 {
-					bt = "full"
+			continue
+		}
+		reconnect = 0
+		a.log.Info("subscribed to desired-state stream")
+
+		streamCtx, cancel := context.WithCancel(ctx)
+		events := make(chan streamMsg, 8)
+		go readStream(streamCtx, sub, events)
+
+		connected := true
+		for connected {
+			select {
+			case <-ctx.Done():
+				cancel()
+				_ = sub.Close()
+				return nil
+			case msg := <-events:
+				if msg.err != nil {
+					if ctx.Err() == nil {
+						a.log.Warn("desired-state stream closed", "err", msg.err)
+					}
+					connected = false
+					continue
 				}
-				if err := deploy.RunBackup(ctx, a.dx, bt); err != nil {
-					a.log.Warn("scheduled backup failed", "type", bt, "err", err)
-					a.emit("warn", "database", "BackupFailed", fmt.Sprintf("Scheduled %s backup failed: %v", bt, err))
-				} else {
-					a.log.Info("scheduled backup complete", "type", bt)
-					a.emit("info", "database", "BackupComplete", fmt.Sprintf("Scheduled %s backup complete.", bt))
+				a.handleServerEvent(ctx, msg.event)
+			case <-heartbeatTicker.C:
+				a.reportHeartbeat(ctx)
+			case <-resyncTicker.C:
+				a.reapply(ctx)
+			case <-fastTicker.C:
+				if a.blocked {
+					a.reapply(ctx)
 				}
+			case <-a.forceRecheckCh:
+				a.nextAttempt = time.Time{} // clear any backoff window so the retry runs now
+				a.reapply(ctx)
+			case <-backupTicker.C:
+				a.runScheduledBackup(ctx, &backupTick)
 			}
+		}
+
+		cancel()
+		_ = sub.Close()
+		if !sleepBackoff(ctx, &reconnect) {
+			return nil
 		}
 	}
 }
 
-// tick fetches the current desired-state, authenticates it, and — generation-gated — reconciles.
-// Health and conditions are collected and reported EVERY tick; the full reconcile pipeline runs only
-// when the generation changed, the last reconcile errored, or the periodic resync interval elapsed.
-func (a *Agent) tick(ctx context.Context) {
-	signed, err := a.cloud.FetchDesiredState(ctx)
-	if err != nil {
-		a.log.Warn("fetch desired-state failed", "err", err)
-		return
+// readStream pumps the Subscribe stream into ch until it errors or ctx is cancelled.
+func readStream(ctx context.Context, sub *cloudapi.Subscription, ch chan<- streamMsg) {
+	for {
+		ev, err := sub.Receive()
+		if err != nil {
+			select {
+			case ch <- streamMsg{err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		select {
+		case ch <- streamMsg{event: ev}:
+		case <-ctx.Done():
+			return
+		}
 	}
+}
 
+// sleepBackoff grows the reconnect backoff (base→cap) and sleeps for it, returning false if ctx is cancelled.
+func sleepBackoff(ctx context.Context, d *time.Duration) bool {
+	switch {
+	case *d == 0:
+		*d = reconnectBackoffBase
+	default:
+		*d *= 2
+		if *d > reconnectBackoffCap {
+			*d = reconnectBackoffCap
+		}
+	}
+	t := time.NewTimer(*d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// handleServerEvent dispatches one decoded Subscribe frame: apply a desired-state push, act on a command,
+// or ignore a keepalive (liveness only).
+func (a *Agent) handleServerEvent(ctx context.Context, ev *cloudapi.ServerEvent) {
+	switch {
+	case ev.DesiredState != nil:
+		a.applySigned(ctx, ev.DesiredState)
+	case ev.Command != nil:
+		if ev.Command.ForceRecheck {
+			a.log.Info("force-recheck command received")
+			a.forceRecheck() // handled on the next select iteration (clears backoff + re-applies)
+		}
+		if ev.Command.RequestStatus {
+			// On-demand cockpit paint: report current status immediately, no reconcile.
+			a.reportHeartbeat(ctx)
+		}
+		if ev.Command.StartLogs != nil {
+			a.logs.start(ev.Command.StartLogs.Target, int(ev.Command.StartLogs.TailLines), ev.Command.StartLogs.Since)
+		}
+		if ev.Command.StopLogs != nil {
+			a.logs.stop(ev.Command.StopLogs.Target)
+		}
+	case ev.KeepAlive:
+		// liveness frame only — nothing to do
+	}
+}
+
+// applySigned authenticates a pushed/fetched signed desired-state and, if valid, applies it. A bad
+// signature is refused (the signed bytes are the only source) and surfaced as a ReconcileError.
+func (a *Agent) applySigned(ctx context.Context, signed *cloudapi.SignedDesiredState) {
 	ds, err := a.verifyDesiredState(signed)
 	if err != nil {
 		a.log.Error("reject desired-state", "err", err)
@@ -213,9 +318,14 @@ func (a *Agent) tick(ctx context.Context) {
 		a.report(ctx, a.lastGeneration, cond, a.collectServices(ctx))
 		return
 	}
+	a.lastDesired = &ds
+	a.applyDesired(ctx, ds)
+}
 
-	// Generation gate: reconcile on a new generation, a lingering error, or the resync cadence — but
-	// hold off while inside a backoff window (a genuine failure / LE rate-limit) so we don't hammer.
+// applyDesired runs the generation-gated reconcile for an already-verified desired-state, then reports
+// status. Reconcile runs on a new generation, a lingering error, or the resync cadence — but not inside a
+// backoff window (a genuine failure / LE rate-limit), so we never hammer.
+func (a *Agent) applyDesired(ctx context.Context, ds cloudapi.DesiredState) {
 	now := time.Now()
 	inBackoff := a.backoff > 0 && now.Before(a.nextAttempt)
 	if !inBackoff && (ds.Generation != a.lastGeneration || a.lastReconcileErr != nil || now.Sub(a.lastResync) >= resyncInterval) {
@@ -237,6 +347,42 @@ func (a *Agent) tick(ctx context.Context) {
 	services := a.collectServices(ctx)
 	conditions := a.buildConditions(a.lastReconcileErr, services)
 	a.report(ctx, a.lastGeneration, conditions, services)
+}
+
+// reapply re-runs applyDesired against the last verified desired-state — used by the force-recheck command
+// and the blocked-state fast-recheck (re-check whether the operator's DNS / secret store is now in place).
+func (a *Agent) reapply(ctx context.Context) {
+	if a.lastDesired == nil {
+		return
+	}
+	a.applyDesired(ctx, *a.lastDesired)
+}
+
+// reportHeartbeat pushes a status heartbeat (health snapshot + current conditions) without reconciling.
+func (a *Agent) reportHeartbeat(ctx context.Context) {
+	services := a.collectServices(ctx)
+	conditions := a.buildConditions(a.lastReconcileErr, services)
+	a.report(ctx, a.lastGeneration, conditions, services)
+}
+
+// runScheduledBackup takes a scheduled pgBackRest backup when the add-on is enabled: incremental hourly,
+// full every 24th tick (daily). The initial full is taken at enable time inside reconcile.
+func (a *Agent) runScheduledBackup(ctx context.Context, tick *int) {
+	if !a.archiving {
+		return
+	}
+	*tick++
+	bt := "incr"
+	if *tick%24 == 0 {
+		bt = "full"
+	}
+	if err := deploy.RunBackup(ctx, a.dx, bt); err != nil {
+		a.log.Warn("scheduled backup failed", "type", bt, "err", err)
+		a.emit("warn", "database", "BackupFailed", fmt.Sprintf("Scheduled %s backup failed: %v", bt, err))
+	} else {
+		a.log.Info("scheduled backup complete", "type", bt)
+		a.emit("info", "database", "BackupComplete", fmt.Sprintf("Scheduled %s backup complete.", bt))
+	}
 }
 
 // enterBackoff grows the exponential backoff (base→cap) and sets the next allowed attempt time.

@@ -5,6 +5,7 @@
 package dockerx
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -14,7 +15,9 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -385,6 +388,99 @@ func (c *Client) readLogs(ctx context.Context, id, tail string) string {
 	var out bytes.Buffer
 	_, _ = stdcopy.StdCopy(&out, &out, rc)
 	return out.String()
+}
+
+// LogTargetAgent is the reserved log target for the agent's own container.
+const LogTargetAgent = "agent"
+
+// LogLine is one demuxed, timestamped container log line.
+type LogLine struct {
+	Stream string // "stdout" | "stderr"
+	Ts     string // RFC3339 timestamp from the docker log stream
+	Line   string
+}
+
+// ResolveLogTarget maps a target key to a tailable container id: "agent" is the agent's own container
+// (its hostname is the container id inside a container), any other value is an owned service by its label.
+func (c *Client) ResolveLogTarget(ctx context.Context, target string) (string, error) {
+	if target == LogTargetAgent {
+		return os.Hostname()
+	}
+	list, err := c.api.ContainerList(ctx, container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", LabelDeployment+"="+c.deploymentID),
+			filters.Arg("label", LabelService+"="+target),
+		),
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(list) == 0 {
+		return "", fmt.Errorf("no container for service %q", target)
+	}
+	return list[0].ID, nil
+}
+
+// FollowLogs tails a container, streaming demuxed lines to out until ctx is cancelled. tailLines is the
+// initial backlog (<=0 = all); since is an optional RFC3339 lower bound. Timestamps are split off each line.
+func (c *Client) FollowLogs(ctx context.Context, containerID string, tailLines int, since string, out chan<- LogLine) error {
+	tail := "all"
+	if tailLines > 0 {
+		tail = strconv.Itoa(tailLines)
+	}
+	rc, err := c.api.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+		Timestamps: true,
+		Tail:       tail,
+		Since:      since,
+	})
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	// Demux stdout/stderr into two pipes so each line keeps its stream tag; StdCopy runs until rc closes.
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	go func() {
+		_, _ = stdcopy.StdCopy(stdoutW, stderrW, rc)
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+	}()
+
+	var wg sync.WaitGroup
+	scan := func(r io.Reader, stream string) {
+		defer wg.Done()
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			ts, line := splitLogTimestamp(sc.Text())
+			select {
+			case out <- LogLine{Stream: stream, Ts: ts, Line: line}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go scan(stdoutR, "stdout")
+	go scan(stderrR, "stderr")
+
+	<-ctx.Done()
+	_ = rc.Close() // unblock StdCopy so the pipes close and the scanners drain
+	wg.Wait()
+	return nil
+}
+
+// splitLogTimestamp splits Docker's "<RFC3339Nano> <content>" prefix off a timestamped log line.
+func splitLogTimestamp(s string) (ts, line string) {
+	if i := strings.IndexByte(s, ' '); i > 0 {
+		return s[:i], s[i+1:]
+	}
+	return "", s
 }
 
 // StatsSample is a point-in-time resource reading for one container.

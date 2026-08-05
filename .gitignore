@@ -2,6 +2,8 @@
 /vritti-agent
 /dist/
 /out/
+# Locally-built protoc plugins (rebuilt by scripts/gen-proto.sh; generated gen/ IS committed)
+/.bin/
 
 # Local agent state (never commit keys/secrets)
 /var/

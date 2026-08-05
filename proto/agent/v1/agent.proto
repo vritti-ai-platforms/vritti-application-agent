@@ -1,0 +1,210 @@
+// The agent <-> cloud wire contract. This proto is the SOURCE OF TRUTH; a byte-identical copy
+// is vendored into cloud-server (apps/cloud-server/proto/agent/v1/agent.proto) for its TS codegen.
+// It mirrors internal/cloudapi/types.go field-for-field — the two MUST stay in sync (same as the
+// current parallel Go/TS types did before gRPC).
+//
+// Transport: Connect (connectrpc). Server-streaming push (Subscribe) + unary calls, over the
+// existing HTTP/1.1 Fastify origin behind proxied api.vrittiai.com. NOT raw gRPC bidi (Cloudflare
+// does not reliably proxy that) — Connect server-streaming rides HTTP/1.1.
+//
+// CRITICAL INVARIANT: the signed desired-state is NOT proto-encoded. protobuf is not canonical
+// across Go/TS, which would break the Ed25519 signature. SignedDesiredState carries the exact
+// canonical-JSON string cloud signed (payload_b64) + the signature over those bytes; the agent
+// verifies the signature over payload_b64 and json.Unmarshals THOSE bytes. Everything else here is
+// proto-native (StatusReport et al. are not content-signed).
+syntax = "proto3";
+
+package agent.v1;
+
+// AgentService is the single Connect service the agent talks to.
+service AgentService {
+  // Enroll is the one-time trust-on-first-use handshake (replaces POST /agent/enroll).
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Subscribe is the single cloud->agent push channel: the agent opens it, cloud immediately sends the
+  // current SignedDesiredState, then a new one on every generation bump — plus Commands (force-recheck,
+  // request-status, start/stop-logs) and KeepAlive. Replaces the 20s desired-state poll AND the resync
+  // fetch (a reconnect re-delivers the current desired-state, so no separate GetDesiredState is needed).
+  rpc Subscribe(SubscribeRequest) returns (stream ServerMessage);
+
+  // ReportStatus is the agent->cloud heartbeat, pushed on every meaningful transition plus a
+  // periodic beat.
+  rpc ReportStatus(StatusReport) returns (ReportAck);
+
+  // StreamLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
+  // agent tails it and streams lines up. Open only while tailing (started/stopped via a Subscribe Command).
+  rpc StreamLogs(stream LogLine) returns (StreamLogsAck);
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment
+// ---------------------------------------------------------------------------
+
+// EnrollRequest presents the one-time token and the agent's fresh public keys.
+message EnrollRequest {
+  string deployment_id = 1;
+  string enroll_token = 2;
+  string signing_pub_key = 3; // agent Ed25519 public (agent->cloud auth)
+  string sealing_pub_key = 4; // agent X25519 public (seal target)
+  string agent_version = 5;
+}
+
+// EnrollResponse returns the long-lived credential + the deployment public key + a signed nonce.
+message EnrollResponse {
+  string agent_credential = 1;   // bearer used on every subsequent request
+  string deployment_pub_key = 2; // base64 Ed25519 public (cloud->agent verify)
+  string nonce = 3;              // random challenge string
+  string nonce_signature = 4;    // signed by the deployment private key
+}
+
+// ---------------------------------------------------------------------------
+// Desired-state push
+// ---------------------------------------------------------------------------
+
+// SubscribeRequest opens the push stream. known_generation lets cloud skip an immediate push when
+// the agent is already current (it still gets future bumps).
+message SubscribeRequest {
+  string deployment_id = 1;
+  int64 known_generation = 2;
+}
+
+// SignedDesiredState wraps the canonical desired-state JSON with cloud's signature over exactly
+// those bytes. Do NOT proto-encode the DesiredState fields — see the file header.
+message SignedDesiredState {
+  string payload_b64 = 1; // canonical desired-state JSON the signature is computed over
+  string signature = 2;   // base64 Ed25519 signature by the deployment key
+}
+
+// ServerMessage is one frame pushed down the Subscribe stream.
+message ServerMessage {
+  oneof msg {
+    SignedDesiredState desired_state = 1;
+    Command command = 2;
+    KeepAlive keep_alive = 3;
+  }
+}
+
+// KeepAlive is sent ~every 30s so Cloudflare's ~100s idle timeout never closes an idle stream.
+message KeepAlive {
+  int64 unix_ts = 1;
+}
+
+// Command is an out-of-band instruction pushed to the agent over the Subscribe stream.
+message Command {
+  oneof kind {
+    ForceRecheck force_recheck = 1;   // clear backoff + reconcile now (e.g. operator confirmed DNS)
+    RequestStatus request_status = 2; // report current status immediately (no reconcile) — on-demand cockpit paint
+    StartLogs start_logs = 3;         // begin tailing a container's logs (a browser opened a log view)
+    StopLogs stop_logs = 4;           // stop tailing (the last viewer left)
+  }
+}
+
+// ForceRecheck clears the reconcile backoff window and reconciles immediately.
+message ForceRecheck {}
+
+// RequestStatus asks the agent to report its current status immediately (no reconcile) — used when a browser
+// opens the cockpit and cloud has no live state yet, so first paint is direct from the agent, not the DB.
+message RequestStatus {}
+
+// StartLogs asks the agent to tail one container and stream its lines up via StreamLogs. target is the
+// container key: "agent" (the agent's own container) or a service name (core-server, postgres, nginx, ...).
+message StartLogs {
+  string target = 1;
+  int32 tail_lines = 2; // initial backlog (e.g. 500)
+  string since = 3;     // RFC3339 lower bound; empty = tail_lines only
+}
+
+// StopLogs asks the agent to stop tailing a container (same target key as StartLogs).
+message StopLogs {
+  string target = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Status heartbeat (agent -> cloud)
+// ---------------------------------------------------------------------------
+
+// StatusReport is the periodic heartbeat the agent pushes to cloud.
+message StatusReport {
+  string deployment_id = 1;
+  int64 generation = 2;                    // desired-state generation currently applied
+  repeated Condition conditions = 3;       // reconcile conditions observed by the agent
+  repeated ServiceStatus services = 4;     // per-service runtime states, tagged by component
+  HostMetrics host = 5;                    // whole-VM resource usage (optional)
+  repeated CertReport certificates = 6;    // managed-edge cert expiries (cloud is system of record)
+  AcmeChallengeDelegation delegation = 7;  // one-time DNS the operator must add (present while blocked)
+  repeated Event events = 8;               // notable transitions to record on the deployment timeline
+}
+
+// ReportAck is the (empty) heartbeat acknowledgement.
+message ReportAck {}
+
+// Condition is one reconcile-condition (Kubernetes-style status).
+message Condition {
+  string type = 1;      // Ready | Reconciling | Blocked | Degraded
+  string status = 2;    // true | false | unknown
+  string reason = 3;    // InSync | Reconciling | ReconcileError | AwaitingDnsDelegation | ServiceUnhealthy | ...
+  string message = 4;
+  string component = 5; // core | database | edge | gitea | secretStore
+  string since = 6;     // RFC3339 transition timestamp
+}
+
+// ServiceStatus is a single service's runtime status, tagged with its component.
+message ServiceStatus {
+  string component = 1; // core | database | edge | gitea
+  string service = 2;
+  string name = 3;
+  string state = 4;
+  string health = 5;
+  double cpu_percent = 6;
+  uint64 memory_bytes = 7;
+}
+
+// HostMetrics is the VM's resource usage at heartbeat time (whole-VM, not per-container).
+message HostMetrics {
+  double cpu_percent = 1;
+  uint64 mem_total_bytes = 2;
+  uint64 mem_used_bytes = 3;
+  uint64 disk_total_bytes = 4;
+  uint64 disk_used_bytes = 5;
+}
+
+// CertReport is the state of one obtained certificate, reported back to cloud (system of record).
+message CertReport {
+  string host = 1;
+  string not_after = 2; // RFC3339 expiry
+  string issued_at = 3; // RFC3339 not-before
+}
+
+// AcmeChallengeDelegation is the DNS the operator must add so the agent's acme-dns can answer the
+// wildcard DNS-01 challenge. Present while the edge is Blocked awaiting the operator; absent once
+// issued. Three records: nameserver A, zone NS, challenge CNAME (see the Go doc comment).
+message AcmeChallengeDelegation {
+  string name = 1;       // CNAME record name: _acme-challenge.<base>
+  string target = 2;     // CNAME record value: <id>.acme.<base>
+  string zone = 3;       // NS record name (the delegated zone): acme.<base>
+  string nameserver = 4; // NS record value AND the A record name: ns.<base>
+  string server_ip = 5;  // A record value — the VM's public IP
+}
+
+// Event is one notable transition the agent asks cloud to record on the deployment timeline.
+message Event {
+  string level = 1;     // info | warn | error
+  string component = 2; // core | database | edge | gitea | secretStore
+  string reason = 3;    // machine reason code
+  string message = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Live logs (agent -> cloud, Phase 4)
+// ---------------------------------------------------------------------------
+
+// LogLine is one tailed container log line, streamed up while a browser is watching.
+message LogLine {
+  string target = 1; // container key this line is from (matches StartLogs.target)
+  string stream = 2; // stdout | stderr
+  string ts = 3;     // RFC3339 timestamp from the docker log line
+  string line = 4;
+}
+
+// StreamLogsAck is the (empty) acknowledgement returned when the agent closes the log stream.
+message StreamLogsAck {}

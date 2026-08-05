@@ -1,0 +1,11 @@
+# buf module config. The proto under proto/ is the source of truth for the agent<->cloud contract
+# (a byte-identical copy is vendored into cloud-server for its TS codegen).
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
