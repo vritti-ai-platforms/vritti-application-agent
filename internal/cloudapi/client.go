@@ -82,24 +82,22 @@ func (c *Client) ReportStatus(ctx context.Context, report StatusReport) error {
 	return err
 }
 
-// LogSender is an open StreamLogs client-stream for pushing tailed container log lines up to cloud.
-type LogSender struct {
-	stream *connect.ClientStreamForClient[agentv1.LogLine, agentv1.StreamLogsAck]
+// LogLineData is one tailed log line to push (the target is passed to PushLogs, so it's not repeated here).
+type LogLineData struct {
+	Stream string // stdout | stderr
+	Ts     string // RFC3339 timestamp from the docker log line
+	Line   string
 }
 
-// OpenLogStream opens the StreamLogs client-stream. Push lines with Send, then Close when the tail stops.
-func (c *Client) OpenLogStream(ctx context.Context) *LogSender {
-	return &LogSender{stream: c.svc.StreamLogs(ctx)}
-}
-
-// Send pushes one tailed log line (tagged with the container target it came from).
-func (s *LogSender) Send(target, stream, ts, line string) error {
-	return s.stream.Send(&agentv1.LogLine{Target: target, Stream: stream, Ts: ts, Line: line})
-}
-
-// Close half-closes the stream and waits for the cloud ack.
-func (s *LogSender) Close() error {
-	_, err := s.stream.CloseAndReceive()
+// PushLogs POSTs a batch of tailed lines for one container target. Unary, not a client-stream: Cloudflare
+// buffers request bodies, so a streamed upload never reaches the origin live — a unary batch does. The agent
+// flushes a batch every ~250ms or when it fills while a browser is watching.
+func (c *Client) PushLogs(ctx context.Context, target string, lines []LogLineData) error {
+	batch := make([]*agentv1.LogLine, len(lines))
+	for i, l := range lines {
+		batch[i] = &agentv1.LogLine{Target: target, Stream: l.Stream, Ts: l.Ts, Line: l.Line}
+	}
+	_, err := c.svc.PushLogs(ctx, connect.NewRequest(&agentv1.LogBatch{Lines: batch}))
 	return err
 }
 

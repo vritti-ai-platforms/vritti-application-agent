@@ -624,7 +624,7 @@ func (*RequestStatus) Descriptor() ([]byte, []int) {
 	return file_agent_v1_agent_proto_rawDescGZIP(), []int{8}
 }
 
-// StartLogs asks the agent to tail one container and stream its lines up via StreamLogs. target is the
+// StartLogs asks the agent to tail one container and push its lines up via PushLogs. target is the
 // container key: "agent" (the agent's own container) or a service name (core-server, postgres, nginx, ...).
 type StartLogs struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1333,7 +1333,7 @@ func (x *Event) GetMessage() string {
 	return ""
 }
 
-// LogLine is one tailed container log line, streamed up while a browser is watching.
+// LogLine is one tailed container log line, pushed up while a browser is watching.
 type LogLine struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Target        string                 `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"` // container key this line is from (matches StartLogs.target)
@@ -1402,27 +1402,31 @@ func (x *LogLine) GetLine() string {
 	return ""
 }
 
-// StreamLogsAck is the (empty) acknowledgement returned when the agent closes the log stream.
-type StreamLogsAck struct {
+// LogBatch is a chunk of tailed lines the agent POSTs (unary) while a browser watches a container. Unary,
+// not client-streaming, because Cloudflare buffers request bodies — a streamed upload never reaches the
+// origin live. The agent flushes a batch every ~250ms or when it fills. Lines carry their own target, so a
+// batch is nominally single-target but need not be.
+type LogBatch struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Lines         []*LogLine             `protobuf:"bytes,1,rep,name=lines,proto3" json:"lines,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *StreamLogsAck) Reset() {
-	*x = StreamLogsAck{}
+func (x *LogBatch) Reset() {
+	*x = LogBatch{}
 	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *StreamLogsAck) String() string {
+func (x *LogBatch) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*StreamLogsAck) ProtoMessage() {}
+func (*LogBatch) ProtoMessage() {}
 
-func (x *StreamLogsAck) ProtoReflect() protoreflect.Message {
+func (x *LogBatch) ProtoReflect() protoreflect.Message {
 	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1434,9 +1438,53 @@ func (x *StreamLogsAck) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use StreamLogsAck.ProtoReflect.Descriptor instead.
-func (*StreamLogsAck) Descriptor() ([]byte, []int) {
+// Deprecated: Use LogBatch.ProtoReflect.Descriptor instead.
+func (*LogBatch) Descriptor() ([]byte, []int) {
 	return file_agent_v1_agent_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *LogBatch) GetLines() []*LogLine {
+	if x != nil {
+		return x.Lines
+	}
+	return nil
+}
+
+// PushLogsAck is the (empty) acknowledgement for a pushed batch.
+type PushLogsAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushLogsAck) Reset() {
+	*x = PushLogsAck{}
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushLogsAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushLogsAck) ProtoMessage() {}
+
+func (x *PushLogsAck) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushLogsAck.ProtoReflect.Descriptor instead.
+func (*PushLogsAck) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{21}
 }
 
 var File_agent_v1_agent_proto protoreflect.FileDescriptor
@@ -1547,14 +1595,15 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x06target\x18\x01 \x01(\tR\x06target\x12\x16\n" +
 	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\tR\x02ts\x12\x12\n" +
-	"\x04line\x18\x04 \x01(\tR\x04line\"\x0f\n" +
-	"\rStreamLogsAck2\x88\x02\n" +
+	"\x04line\x18\x04 \x01(\tR\x04line\"3\n" +
+	"\bLogBatch\x12'\n" +
+	"\x05lines\x18\x01 \x03(\v2\x11.agent.v1.LogLineR\x05lines\"\r\n" +
+	"\vPushLogsAck2\x83\x02\n" +
 	"\fAgentService\x12;\n" +
 	"\x06Enroll\x12\x17.agent.v1.EnrollRequest\x1a\x18.agent.v1.EnrollResponse\x12B\n" +
 	"\tSubscribe\x12\x1a.agent.v1.SubscribeRequest\x1a\x17.agent.v1.ServerMessage0\x01\x12;\n" +
-	"\fReportStatus\x12\x16.agent.v1.StatusReport\x1a\x13.agent.v1.ReportAck\x12:\n" +
-	"\n" +
-	"StreamLogs\x12\x11.agent.v1.LogLine\x1a\x17.agent.v1.StreamLogsAck(\x01B\xa9\x01\n" +
+	"\fReportStatus\x12\x16.agent.v1.StatusReport\x1a\x13.agent.v1.ReportAck\x125\n" +
+	"\bPushLogs\x12\x12.agent.v1.LogBatch\x1a\x15.agent.v1.PushLogsAckB\xa9\x01\n" +
 	"\fcom.agent.v1B\n" +
 	"AgentProtoP\x01ZLgithub.com/vritti-ai-platforms/vritti-application-agent/gen/agent/v1;agentv1\xa2\x02\x03AXX\xaa\x02\bAgent.V1\xca\x02\bAgent\\V1\xe2\x02\x14Agent\\V1\\GPBMetadata\xea\x02\tAgent::V1b\x06proto3"
 
@@ -1570,7 +1619,7 @@ func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 	return file_agent_v1_agent_proto_rawDescData
 }
 
-var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_agent_v1_agent_proto_goTypes = []any{
 	(*EnrollRequest)(nil),           // 0: agent.v1.EnrollRequest
 	(*EnrollResponse)(nil),          // 1: agent.v1.EnrollResponse
@@ -1592,7 +1641,8 @@ var file_agent_v1_agent_proto_goTypes = []any{
 	(*AcmeChallengeDelegation)(nil), // 17: agent.v1.AcmeChallengeDelegation
 	(*Event)(nil),                   // 18: agent.v1.Event
 	(*LogLine)(nil),                 // 19: agent.v1.LogLine
-	(*StreamLogsAck)(nil),           // 20: agent.v1.StreamLogsAck
+	(*LogBatch)(nil),                // 20: agent.v1.LogBatch
+	(*PushLogsAck)(nil),             // 21: agent.v1.PushLogsAck
 }
 var file_agent_v1_agent_proto_depIdxs = []int32{
 	3,  // 0: agent.v1.ServerMessage.desired_state:type_name -> agent.v1.SignedDesiredState
@@ -1608,19 +1658,20 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	16, // 10: agent.v1.StatusReport.certificates:type_name -> agent.v1.CertReport
 	17, // 11: agent.v1.StatusReport.delegation:type_name -> agent.v1.AcmeChallengeDelegation
 	18, // 12: agent.v1.StatusReport.events:type_name -> agent.v1.Event
-	0,  // 13: agent.v1.AgentService.Enroll:input_type -> agent.v1.EnrollRequest
-	2,  // 14: agent.v1.AgentService.Subscribe:input_type -> agent.v1.SubscribeRequest
-	11, // 15: agent.v1.AgentService.ReportStatus:input_type -> agent.v1.StatusReport
-	19, // 16: agent.v1.AgentService.StreamLogs:input_type -> agent.v1.LogLine
-	1,  // 17: agent.v1.AgentService.Enroll:output_type -> agent.v1.EnrollResponse
-	4,  // 18: agent.v1.AgentService.Subscribe:output_type -> agent.v1.ServerMessage
-	12, // 19: agent.v1.AgentService.ReportStatus:output_type -> agent.v1.ReportAck
-	20, // 20: agent.v1.AgentService.StreamLogs:output_type -> agent.v1.StreamLogsAck
-	17, // [17:21] is the sub-list for method output_type
-	13, // [13:17] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	19, // 13: agent.v1.LogBatch.lines:type_name -> agent.v1.LogLine
+	0,  // 14: agent.v1.AgentService.Enroll:input_type -> agent.v1.EnrollRequest
+	2,  // 15: agent.v1.AgentService.Subscribe:input_type -> agent.v1.SubscribeRequest
+	11, // 16: agent.v1.AgentService.ReportStatus:input_type -> agent.v1.StatusReport
+	20, // 17: agent.v1.AgentService.PushLogs:input_type -> agent.v1.LogBatch
+	1,  // 18: agent.v1.AgentService.Enroll:output_type -> agent.v1.EnrollResponse
+	4,  // 19: agent.v1.AgentService.Subscribe:output_type -> agent.v1.ServerMessage
+	12, // 20: agent.v1.AgentService.ReportStatus:output_type -> agent.v1.ReportAck
+	21, // 21: agent.v1.AgentService.PushLogs:output_type -> agent.v1.PushLogsAck
+	18, // [18:22] is the sub-list for method output_type
+	14, // [14:18] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_agent_proto_init() }
@@ -1645,7 +1696,7 @@ func file_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

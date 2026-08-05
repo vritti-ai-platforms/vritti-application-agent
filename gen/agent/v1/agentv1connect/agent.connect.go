@@ -55,8 +55,8 @@ const (
 	// AgentServiceReportStatusProcedure is the fully-qualified name of the AgentService's ReportStatus
 	// RPC.
 	AgentServiceReportStatusProcedure = "/agent.v1.AgentService/ReportStatus"
-	// AgentServiceStreamLogsProcedure is the fully-qualified name of the AgentService's StreamLogs RPC.
-	AgentServiceStreamLogsProcedure = "/agent.v1.AgentService/StreamLogs"
+	// AgentServicePushLogsProcedure is the fully-qualified name of the AgentService's PushLogs RPC.
+	AgentServicePushLogsProcedure = "/agent.v1.AgentService/PushLogs"
 )
 
 // AgentServiceClient is a client for the agent.v1.AgentService service.
@@ -71,9 +71,11 @@ type AgentServiceClient interface {
 	// ReportStatus is the agent->cloud heartbeat, pushed on every meaningful transition plus a
 	// periodic beat.
 	ReportStatus(context.Context, *connect.Request[v1.StatusReport]) (*connect.Response[v1.ReportAck], error)
-	// StreamLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
-	// agent tails it and streams lines up. Open only while tailing (started/stopped via a Subscribe Command).
-	StreamLogs(context.Context) *connect.ClientStreamForClient[v1.LogLine, v1.StreamLogsAck]
+	// PushLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
+	// agent tails it and POSTs batches of lines. Unary (NOT client-streaming) on purpose — Cloudflare buffers
+	// request bodies, so a streamed upload never reaches the origin live; a unary batch does. Started/stopped
+	// via a Subscribe Command; the agent flushes a batch every ~250ms or when it fills up.
+	PushLogs(context.Context, *connect.Request[v1.LogBatch]) (*connect.Response[v1.PushLogsAck], error)
 }
 
 // NewAgentServiceClient constructs a client for the agent.v1.AgentService service. By default, it
@@ -105,10 +107,10 @@ func NewAgentServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 			connect.WithSchema(agentServiceMethods.ByName("ReportStatus")),
 			connect.WithClientOptions(opts...),
 		),
-		streamLogs: connect.NewClient[v1.LogLine, v1.StreamLogsAck](
+		pushLogs: connect.NewClient[v1.LogBatch, v1.PushLogsAck](
 			httpClient,
-			baseURL+AgentServiceStreamLogsProcedure,
-			connect.WithSchema(agentServiceMethods.ByName("StreamLogs")),
+			baseURL+AgentServicePushLogsProcedure,
+			connect.WithSchema(agentServiceMethods.ByName("PushLogs")),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -119,7 +121,7 @@ type agentServiceClient struct {
 	enroll       *connect.Client[v1.EnrollRequest, v1.EnrollResponse]
 	subscribe    *connect.Client[v1.SubscribeRequest, v1.ServerMessage]
 	reportStatus *connect.Client[v1.StatusReport, v1.ReportAck]
-	streamLogs   *connect.Client[v1.LogLine, v1.StreamLogsAck]
+	pushLogs     *connect.Client[v1.LogBatch, v1.PushLogsAck]
 }
 
 // Enroll calls agent.v1.AgentService.Enroll.
@@ -137,9 +139,9 @@ func (c *agentServiceClient) ReportStatus(ctx context.Context, req *connect.Requ
 	return c.reportStatus.CallUnary(ctx, req)
 }
 
-// StreamLogs calls agent.v1.AgentService.StreamLogs.
-func (c *agentServiceClient) StreamLogs(ctx context.Context) *connect.ClientStreamForClient[v1.LogLine, v1.StreamLogsAck] {
-	return c.streamLogs.CallClientStream(ctx)
+// PushLogs calls agent.v1.AgentService.PushLogs.
+func (c *agentServiceClient) PushLogs(ctx context.Context, req *connect.Request[v1.LogBatch]) (*connect.Response[v1.PushLogsAck], error) {
+	return c.pushLogs.CallUnary(ctx, req)
 }
 
 // AgentServiceHandler is an implementation of the agent.v1.AgentService service.
@@ -154,9 +156,11 @@ type AgentServiceHandler interface {
 	// ReportStatus is the agent->cloud heartbeat, pushed on every meaningful transition plus a
 	// periodic beat.
 	ReportStatus(context.Context, *connect.Request[v1.StatusReport]) (*connect.Response[v1.ReportAck], error)
-	// StreamLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
-	// agent tails it and streams lines up. Open only while tailing (started/stopped via a Subscribe Command).
-	StreamLogs(context.Context, *connect.ClientStream[v1.LogLine]) (*connect.Response[v1.StreamLogsAck], error)
+	// PushLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
+	// agent tails it and POSTs batches of lines. Unary (NOT client-streaming) on purpose — Cloudflare buffers
+	// request bodies, so a streamed upload never reaches the origin live; a unary batch does. Started/stopped
+	// via a Subscribe Command; the agent flushes a batch every ~250ms or when it fills up.
+	PushLogs(context.Context, *connect.Request[v1.LogBatch]) (*connect.Response[v1.PushLogsAck], error)
 }
 
 // NewAgentServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -184,10 +188,10 @@ func NewAgentServiceHandler(svc AgentServiceHandler, opts ...connect.HandlerOpti
 		connect.WithSchema(agentServiceMethods.ByName("ReportStatus")),
 		connect.WithHandlerOptions(opts...),
 	)
-	agentServiceStreamLogsHandler := connect.NewClientStreamHandler(
-		AgentServiceStreamLogsProcedure,
-		svc.StreamLogs,
-		connect.WithSchema(agentServiceMethods.ByName("StreamLogs")),
+	agentServicePushLogsHandler := connect.NewUnaryHandler(
+		AgentServicePushLogsProcedure,
+		svc.PushLogs,
+		connect.WithSchema(agentServiceMethods.ByName("PushLogs")),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/agent.v1.AgentService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -198,8 +202,8 @@ func NewAgentServiceHandler(svc AgentServiceHandler, opts ...connect.HandlerOpti
 			agentServiceSubscribeHandler.ServeHTTP(w, r)
 		case AgentServiceReportStatusProcedure:
 			agentServiceReportStatusHandler.ServeHTTP(w, r)
-		case AgentServiceStreamLogsProcedure:
-			agentServiceStreamLogsHandler.ServeHTTP(w, r)
+		case AgentServicePushLogsProcedure:
+			agentServicePushLogsHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -221,6 +225,6 @@ func (UnimplementedAgentServiceHandler) ReportStatus(context.Context, *connect.R
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("agent.v1.AgentService.ReportStatus is not implemented"))
 }
 
-func (UnimplementedAgentServiceHandler) StreamLogs(context.Context, *connect.ClientStream[v1.LogLine]) (*connect.Response[v1.StreamLogsAck], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("agent.v1.AgentService.StreamLogs is not implemented"))
+func (UnimplementedAgentServiceHandler) PushLogs(context.Context, *connect.Request[v1.LogBatch]) (*connect.Response[v1.PushLogsAck], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("agent.v1.AgentService.PushLogs is not implemented"))
 }

@@ -31,9 +31,11 @@ service AgentService {
   // periodic beat.
   rpc ReportStatus(StatusReport) returns (ReportAck);
 
-  // StreamLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
-  // agent tails it and streams lines up. Open only while tailing (started/stopped via a Subscribe Command).
-  rpc StreamLogs(stream LogLine) returns (StreamLogsAck);
+  // PushLogs is the request-driven live-log DATA channel: while a browser is watching a container, the
+  // agent tails it and POSTs batches of lines. Unary (NOT client-streaming) on purpose — Cloudflare buffers
+  // request bodies, so a streamed upload never reaches the origin live; a unary batch does. Started/stopped
+  // via a Subscribe Command; the agent flushes a batch every ~250ms or when it fills up.
+  rpc PushLogs(LogBatch) returns (PushLogsAck);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +108,7 @@ message ForceRecheck {}
 // opens the cockpit and cloud has no live state yet, so first paint is direct from the agent, not the DB.
 message RequestStatus {}
 
-// StartLogs asks the agent to tail one container and stream its lines up via StreamLogs. target is the
+// StartLogs asks the agent to tail one container and push its lines up via PushLogs. target is the
 // container key: "agent" (the agent's own container) or a service name (core-server, postgres, nginx, ...).
 message StartLogs {
   string target = 1;
@@ -198,7 +200,7 @@ message Event {
 // Live logs (agent -> cloud, Phase 4)
 // ---------------------------------------------------------------------------
 
-// LogLine is one tailed container log line, streamed up while a browser is watching.
+// LogLine is one tailed container log line, pushed up while a browser is watching.
 message LogLine {
   string target = 1; // container key this line is from (matches StartLogs.target)
   string stream = 2; // stdout | stderr
@@ -206,5 +208,13 @@ message LogLine {
   string line = 4;
 }
 
-// StreamLogsAck is the (empty) acknowledgement returned when the agent closes the log stream.
-message StreamLogsAck {}
+// LogBatch is a chunk of tailed lines the agent POSTs (unary) while a browser watches a container. Unary,
+// not client-streaming, because Cloudflare buffers request bodies — a streamed upload never reaches the
+// origin live. The agent flushes a batch every ~250ms or when it fills. Lines carry their own target, so a
+// batch is nominally single-target but need not be.
+message LogBatch {
+  repeated LogLine lines = 1;
+}
+
+// PushLogsAck is the (empty) acknowledgement for a pushed batch.
+message PushLogsAck {}

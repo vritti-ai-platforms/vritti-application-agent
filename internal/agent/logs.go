@@ -4,15 +4,23 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/cloudapi"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
 )
 
-// logManager tails container logs on demand and streams them to cloud. Each active target ("agent" or a
-// service) gets its own independent tail goroutine + StreamLogs client-stream; StopLogs cancels it. Cloud
-// ref-counts browser viewers and only asks the agent to tail while at least one is watching, so a tail
-// exists only while someone is looking.
+// logFlushInterval / logBatchMax bound how the agent batches tailed lines before POSTing them via PushLogs:
+// flush at least this often (keeps latency low) and whenever a batch fills (keeps requests bounded).
+const (
+	logFlushInterval = 250 * time.Millisecond
+	logBatchMax      = 200
+)
+
+// logManager tails container logs on demand and pushes them to cloud. Each active target ("agent" or a
+// service) gets its own independent tail goroutine; StopLogs cancels it. Lines are batched and POSTed via the
+// unary PushLogs (NOT a client-stream — Cloudflare buffers request bodies). Cloud ref-counts browser viewers
+// and only asks the agent to tail while at least one is watching, so a tail exists only while someone looks.
 type logManager struct {
 	baseCtx context.Context
 	dx      *dockerx.Client
@@ -52,7 +60,7 @@ func (m *logManager) stop(target string) {
 	}
 }
 
-// run resolves the container, opens a StreamLogs stream, and forwards demuxed lines up until ctx is cancelled.
+// run resolves the container, tails it, and pushes batched demuxed lines up via PushLogs until ctx is cancelled.
 func (m *logManager) run(ctx context.Context, target string, tailLines int, since string) {
 	defer func() {
 		m.mu.Lock()
@@ -66,14 +74,27 @@ func (m *logManager) run(ctx context.Context, target string, tailLines int, sinc
 		return
 	}
 
-	sender := m.cloud.OpenLogStream(ctx)
-	defer func() { _ = sender.Close() }()
-
 	lines := make(chan dockerx.LogLine, 128)
 	go func() {
 		_ = m.dx.FollowLogs(ctx, id, tailLines, since, lines)
 		close(lines)
 	}()
+
+	batch := make([]cloudapi.LogLineData, 0, logBatchMax)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		// Use baseCtx, not ctx: on StopLogs (ctx cancelled) we still want the final batch to land.
+		if err := m.cloud.PushLogs(m.baseCtx, target, batch); err != nil {
+			m.log.Warn("push logs failed", "target", target, "err", err)
+		}
+		batch = batch[:0]
+	}
+	defer flush()
+
+	ticker := time.NewTicker(logFlushInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -81,10 +102,12 @@ func (m *logManager) run(ctx context.Context, target string, tailLines int, sinc
 			if !ok {
 				return
 			}
-			if err := sender.Send(target, line.Stream, line.Ts, line.Line); err != nil {
-				m.log.Warn("log stream send failed", "target", target, "err", err)
-				return
+			batch = append(batch, cloudapi.LogLineData{Stream: line.Stream, Ts: line.Ts, Line: line.Line})
+			if len(batch) >= logBatchMax {
+				flush()
 			}
+		case <-ticker.C:
+			flush()
 		case <-ctx.Done():
 			return
 		}
