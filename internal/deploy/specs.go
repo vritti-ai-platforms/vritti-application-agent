@@ -110,6 +110,13 @@ func RedisSpec(ds cloudapi.DesiredState, redisPassword string) dockerx.RunSpec {
 		Network:      Network,
 		Restart:      true,
 		MemLimit:     160 * mib,
+		Health: &dockerx.HealthSpec{
+			Test:     []string{"CMD", "redis-cli", "--no-auth-warning", "-a", redisPassword, "ping"},
+			Interval: 10 * time.Second,
+			Timeout:  5 * time.Second,
+			Retries:  5,
+			Start:    20 * time.Second,
+		},
 	}
 }
 
@@ -237,5 +244,12 @@ func NginxSpec(ds cloudapi.DesiredState, stackRoot string) dockerx.RunSpec {
 		Network:  Network,
 		Restart:  true,
 		MemLimit: 96 * mib,
+		Health: &dockerx.HealthSpec{
+			Test:     []string{"CMD", "wget", "-q", "--spider", "http://localhost/healthz"},
+			Interval: 10 * time.Second,
+			Timeout:  5 * time.Second,
+			Retries:  5,
+			Start:    20 * time.Second,
+		},
 	}
 }

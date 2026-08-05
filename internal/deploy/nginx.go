@@ -64,7 +64,9 @@ func DerivedRoutes(baseDomain string, corePort int, gitea bool) []cloudapi.Domai
 // calls /api/... on its own subdomain).
 func RenderNginxConf(stackRoot, baseDomain string, corePort int, routes []cloudapi.DomainRoute) string {
 	var b strings.Builder
-	b.WriteString("server {\n  listen 80;\n  server_name _;\n  location / { return 301 https://$host$request_uri; }\n}\n\n")
+	// Exact-match /healthz is served on port 80 without the redirect (nginx prefers `= /healthz` over
+	// the catch-all `location /`), so the container healthcheck's wget gets 200 instead of a 301.
+	b.WriteString("server {\n  listen 80;\n  server_name _;\n  location = /healthz { return 200; access_log off; }\n  location / { return 301 https://$host$request_uri; }\n}\n\n")
 
 	if baseDomain == "" || !hasCert(stackRoot, baseDomain) {
 		return b.String() // wildcard not issued yet → HTTP only
