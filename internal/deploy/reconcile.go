@@ -30,7 +30,13 @@ func Apply(ctx context.Context, dx *dockerx.Client, spec dockerx.RunSpec) error 
 		return err
 	}
 	if have == want {
-		return nil // already converged
+		// Spec unchanged — but "converged" must also mean actually running. A crash that exhausted its
+		// restart retries, or a manual `docker stop` (RestartPolicyUnlessStopped won't undo that), leaves a
+		// matching-hash container stopped; a hash-only check would strand it down until the spec changes.
+		if _, err := dx.EnsureStarted(ctx, spec.Name); err != nil {
+			return err
+		}
+		return nil
 	}
 	if spec.Labels == nil {
 		spec.Labels = map[string]string{}

@@ -259,6 +259,28 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 	return c.api.ContainerRestart(ctx, id, container.StopOptions{})
 }
 
+// EnsureStarted starts the named container if it exists but is not running, and reports whether it had to
+// start it. No-op (started=false) when it's already running or absent. Lets the reconciler self-heal a
+// crashed or manually-stopped service whose spec is otherwise unchanged (RestartPolicyUnlessStopped means
+// Docker won't bring a manual `docker stop` back on its own).
+func (c *Client) EnsureStarted(ctx context.Context, name string) (bool, error) {
+	id, ok, err := c.containerByName(ctx, name)
+	if err != nil || !ok {
+		return false, err
+	}
+	insp, err := c.api.ContainerInspect(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if insp.State != nil && insp.State.Running {
+		return false, nil
+	}
+	if err := c.api.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+		return false, fmt.Errorf("start %s: %w", name, err)
+	}
+	return true, nil
+}
+
 // create builds the container from a RunSpec and returns its id (does not start it).
 func (c *Client) create(ctx context.Context, spec RunSpec) (string, error) {
 	labels := map[string]string{
