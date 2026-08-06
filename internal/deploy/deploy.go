@@ -50,19 +50,11 @@ func (d DBConn) DirectURL() string {
 // Redis. They come from Infisical's `/agent` folder (never generated, never seen by cloud) and are
 // threaded through the reconcile rather than read from cfg.
 type ManagedProvisioning struct {
-	DBName        string // per-deployment DB name (defaults to vritti_core when empty)
+	DBName        string // per-deployment DB name — from DB_NAME in /agent/postgres (required; no fallback)
 	OwnerPassword string // vritti_core_owner — the container superuser + migration role
 	AppPassword   string // vritti_core_app — least-privilege runtime login
 	GiteaPassword string // gitea — least-privilege login owning only the gitea schema
 	RedisPassword string
-}
-
-// database returns the configured DB name, defaulting to vritti_core.
-func (p ManagedProvisioning) database() string {
-	if p.DBName == "" {
-		return "vritti_core"
-	}
-	return p.DBName
 }
 
 // ManagedDBConn builds the connection for the containerized Postgres from the provisioning creds.
@@ -70,7 +62,7 @@ func ManagedDBConn(p ManagedProvisioning) DBConn {
 	return DBConn{
 		Host:          SvcPostgres,
 		Port:          "5432",
-		Database:      p.database(),
+		Database:      p.DBName,
 		AppUser:       "vritti_core_app",
 		AppPassword:   p.AppPassword,
 		OwnerUser:     "vritti_core_owner",
