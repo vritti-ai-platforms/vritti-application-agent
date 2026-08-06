@@ -8,6 +8,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner for a manual build — use self-hosted only when GitHub hosted runners are unavailable'
+        type: choice
+        options: [ubuntu-latest, self-hosted]
+        default: ubuntu-latest
 
 concurrency:
   group: build-${{ github.ref }}
@@ -21,7 +27,8 @@ permissions:
 jobs:
   check:
     name: Go build & vet
-    runs-on: ubuntu-latest
+    # push → hosted ubuntu-latest; manual dispatch → the chosen runner (self-hosted fallback).
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,4 +58,6 @@ jobs:
       build_context: .
       package_json_path: ./version.json
       skip_lint_test: true
+      # push → hosted (default); manual dispatch → the chosen runner (self-hosted fallback).
+      runner: ${{ inputs.runner || 'ubuntu-latest' }}
     secrets: inherit
