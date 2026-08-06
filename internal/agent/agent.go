@@ -25,7 +25,6 @@ import (
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/gitea"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/host"
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secretprovider"
-	"github.com/vritti-ai-platforms/vritti-application-agent/internal/secrets"
 )
 
 // Version is the agent build version reported to cloud at enrollment.
@@ -67,7 +66,6 @@ type Agent struct {
 	cfg        *config.Config
 	log        *slog.Logger
 	keys       *agentcrypto.Keys
-	machine    *secrets.Machine
 	dx         *dockerx.Client
 	cloud      *cloudapi.Client
 	enrollment *cloudapi.Enrollment
@@ -109,17 +107,13 @@ type Agent struct {
 	pendingEvents []cloudapi.Event
 }
 
-// New bootstraps the agent: loads config, local keys, machine secrets, and the Docker client.
+// New bootstraps the agent: loads config, local keys, and the Docker client.
 func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
 	}
 	keys, err := agentcrypto.LoadOrCreate(cfg.KeysDir())
-	if err != nil {
-		return nil, err
-	}
-	machine, err := secrets.LoadOrCreate(cfg.SecretsDir())
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +124,7 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 	cloud := cloudapi.New(cfg.CloudAPIURL, cfg.DeploymentID, keys)
 
 	return &Agent{
-		cfg: cfg, log: log, keys: keys, machine: machine, dx: dx, cloud: cloud,
+		cfg: cfg, log: log, keys: keys, dx: dx, cloud: cloud,
 		forceRecheckCh: make(chan struct{}, 1),
 	}, nil
 }
@@ -609,21 +603,55 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	if err != nil {
 		return fmt.Errorf("secrets /commerce-service: %w", err)
 	}
-	agentEnv, err := provider.Fetch(ctx, "/agent")
+	// (4) Provisioning creds + Gitea admin, from the per-component /agent sub-folders (each validated up
+	// front so a missing key fails the reconcile naming the exact folder). Redis is an always-on core
+	// service, so /agent/redis is always required; the managed-DB creds (/agent/postgres + gitea's DB role)
+	// only in managed mode (external DB uses the sealed external_db secret); /agent/gitea's admin creds only
+	// when the add-on runs. /agent/ansible holds the ops bootstrap keys and is NOT read here.
+	redisEnv, err := provider.Fetch(ctx, "/agent/redis")
 	if err != nil {
-		return fmt.Errorf("secrets /agent: %w", err)
+		return fmt.Errorf("secrets /agent/redis: %w", err)
+	}
+	if err := deploy.RequireSecrets("/agent/redis", redisEnv, "REDIS_PASSWORD"); err != nil {
+		return err
+	}
+	prov := deploy.ManagedProvisioning{RedisPassword: redisEnv["REDIS_PASSWORD"]}
+
+	// Gitea's folder holds both its managed-DB role password (to provision the shared DB) and its admin
+	// bootstrap creds (only when the add-on runs) — fetch it once if either applies.
+	var giteaEnv map[string]string
+	if dbManaged || giteaEnabled {
+		giteaEnv, err = provider.Fetch(ctx, "/agent/gitea")
+		if err != nil {
+			return fmt.Errorf("secrets /agent/gitea: %w", err)
+		}
 	}
 
-	// (4) Derive the managed-mode provisioning values + Gitea admin creds from the `/agent` map.
-	prov := deploy.ManagedProvisioning{
-		DBName:        agentEnv["DB_NAME"],
-		OwnerPassword: agentEnv["DB_OWNER_PASSWORD"],
-		AppPassword:   agentEnv["DB_APP_PASSWORD"],
-		GiteaPassword: agentEnv["DB_GITEA_PASSWORD"],
-		RedisPassword: agentEnv["REDIS_PASSWORD"],
+	if dbManaged {
+		pgEnv, err := provider.Fetch(ctx, "/agent/postgres")
+		if err != nil {
+			return fmt.Errorf("secrets /agent/postgres: %w", err)
+		}
+		if err := deploy.RequireSecrets("/agent/postgres", pgEnv, "DB_NAME", "DB_OWNER_PASSWORD", "DB_APP_PASSWORD"); err != nil {
+			return err
+		}
+		if err := deploy.RequireSecrets("/agent/gitea", giteaEnv, "DB_GITEA_PASSWORD"); err != nil {
+			return err
+		}
+		prov.DBName = pgEnv["DB_NAME"]
+		prov.OwnerPassword = pgEnv["DB_OWNER_PASSWORD"]
+		prov.AppPassword = pgEnv["DB_APP_PASSWORD"]
+		prov.GiteaPassword = giteaEnv["DB_GITEA_PASSWORD"]
 	}
-	giteaAdminUser := agentEnv["GITEA_ADMIN_USER"]
-	giteaAdminPw := agentEnv["GITEA_ADMIN_PASSWORD"]
+
+	var giteaAdminUser, giteaAdminPw string
+	if giteaEnabled {
+		if err := deploy.RequireSecrets("/agent/gitea", giteaEnv, "GITEA_ADMIN_USER", "GITEA_ADMIN_PASSWORD"); err != nil {
+			return err
+		}
+		giteaAdminUser = giteaEnv["GITEA_ADMIN_USER"]
+		giteaAdminPw = giteaEnv["GITEA_ADMIN_PASSWORD"]
+	}
 
 	// (5) Resolve the DB connection — the mode branch (managed = provisioning creds, external = sealed).
 	db, err := deploy.ResolveDBConn(ds, prov, externalSecret)
@@ -725,17 +753,22 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 		if archiving {
 			a.step(ds.Generation, "database", "EnablingBackups", "Enabling pgBackRest backups for the managed database.")
 			// Config must exist before Postgres boots so archive_command works from the first WAL.
-			// The S3-compatible OFFSITE backup creds (S3_*) live in a DEDICATED `/backup` secret-store
-			// folder — NOT `/core-server` (whose bucket is the app's media store). Best-effort: if
-			// `/backup` is absent/empty, pgBackRest runs local-repo only. pg1-user = real superuser.
-			backupEnv, err := provider.Fetch(ctx, "/backup")
+			// The S3-compatible OFFSITE backup creds (S3_*) live in a DEDICATED `/agent/backup` secret-store
+			// folder — NOT `/core-server` (whose bucket is the app's media store). required when backups are on: if
+			// `/backup` is absent/empty or a key is missing, the reconcile fails (validated below). pg1-user = real superuser.
+			backupEnv, err := provider.Fetch(ctx, "/agent/backup")
 			if err != nil {
-				a.log.Warn("fetch /backup secrets failed — pgBackRest runs local-repo only", "err", err)
+				a.log.Warn("fetch /backup secrets failed — it is required when the backup add-on is enabled", "err", err)
 				backupEnv = map[string]string{}
+			}
+			// Fail loudly (as a reconcile error) BEFORE writing the conf / creating the stanza when a required
+			// backup secret is missing, so the operator sees exactly what to add in `/backup`.
+			if err := deploy.ValidateBackupSecrets(backupEnv); err != nil {
+				return err
 			}
 			confDir := deploy.PgBackRestConfDir(a.cfg.StackRoot)
 			confPath := filepath.Join(confDir, "pgbackrest.conf")
-			conf := deploy.RenderPgBackRestConf(ds, a.machine, backupEnv, db.OwnerUser)
+			conf := deploy.RenderPgBackRestConf(ds, backupEnv, db.OwnerUser)
 			if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
 				return err
 			}
@@ -914,12 +947,46 @@ func (a *Agent) report(ctx context.Context, generation int64, conditions []cloud
 			MemUsedBytes:   hm.MemUsedBytes,
 			DiskTotalBytes: hm.DiskTotalBytes,
 			DiskUsedBytes:  hm.DiskUsedBytes,
+			DiskBreakdown:  a.collectDiskBreakdown(ctx, hm.DiskUsedBytes),
 		},
 	})
 	if err != nil {
 		a.log.Warn("status report failed", "err", err)
 		// Re-queue the drained events so a transient report failure doesn't drop timeline entries.
 		a.pendingEvents = append(events, a.pendingEvents...)
+	}
+}
+
+// collectDiskBreakdown builds the per-category split of the VM's used disk so the cockpit can show WHERE it
+// went: docker images/containers (from the Engine API) + du of the stack's bind-mount dirs, with "other"
+// absorbing the OS + anything unaccounted. Best-effort — a failing docker/du yields a zero for that slice,
+// never an error. `used` is the whole-disk used bytes the categories are apportioned against.
+func (a *Agent) collectDiskBreakdown(ctx context.Context, used uint64) []cloudapi.DiskUsageEntry {
+	root := a.cfg.StackRoot
+	images, containers, err := a.dx.DiskUsage(ctx)
+	if err != nil {
+		a.log.Warn("docker disk usage failed", "err", err)
+	}
+	database := host.DirSize(deploy.PostgresDataDir(root))
+	backups := host.DirSize(deploy.PgBackRestRepoDir(root))
+	giteaData := host.DirSize(deploy.GiteaDataDir(root))
+	certs := host.DirSize(filepath.Join(root, "letsencrypt"))
+	logs := host.DirSize(filepath.Join(root, "logs"))
+
+	accounted := images + containers + database + backups + giteaData + certs + logs
+	var other uint64
+	if used > accounted {
+		other = used - accounted
+	}
+	return []cloudapi.DiskUsageEntry{
+		{Name: "docker-images", Bytes: images},
+		{Name: "docker-containers", Bytes: containers},
+		{Name: "database", Bytes: database},
+		{Name: "backups", Bytes: backups},
+		{Name: "gitea", Bytes: giteaData},
+		{Name: "certificates", Bytes: certs},
+		{Name: "logs", Bytes: logs},
+		{Name: "other", Bytes: other},
 	}
 }
 

@@ -5,7 +5,9 @@ package host
 
 import (
 	"bufio"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +30,22 @@ func Collect(diskPath string) Metrics {
 	m.MemTotalBytes, m.MemUsedBytes = memUsage()
 	m.DiskTotalBytes, m.DiskUsedBytes = diskUsage(diskPath)
 	return m
+}
+
+// DirSize returns the total size (bytes) of all files under path. A missing/unreadable path returns 0, and
+// unreadable entries are skipped so a partial dir still reports what it can — used for the disk breakdown.
+func DirSize(path string) uint64 {
+	var total uint64
+	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // skip unreadable entries rather than abort the walk
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			total += uint64(info.Size())
+		}
+		return nil
+	})
+	return total
 }
 
 // diskUsage returns total + used bytes of the filesystem backing path.

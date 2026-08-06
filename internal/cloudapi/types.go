@@ -189,11 +189,19 @@ type Enrollment struct {
 
 // HostMetrics is the VM's resource usage at heartbeat time (whole-VM, not per-container).
 type HostMetrics struct {
-	CPUPercent     float64 `json:"cpuPercent"`
-	MemTotalBytes  uint64  `json:"memTotalBytes"`
-	MemUsedBytes   uint64  `json:"memUsedBytes"`
-	DiskTotalBytes uint64  `json:"diskTotalBytes"`
-	DiskUsedBytes  uint64  `json:"diskUsedBytes"`
+	CPUPercent     float64          `json:"cpuPercent"`
+	MemTotalBytes  uint64           `json:"memTotalBytes"`
+	MemUsedBytes   uint64           `json:"memUsedBytes"`
+	DiskTotalBytes uint64           `json:"diskTotalBytes"`
+	DiskUsedBytes  uint64           `json:"diskUsedBytes"`
+	DiskBreakdown  []DiskUsageEntry `json:"diskBreakdown,omitempty"`
+}
+
+// DiskUsageEntry is one labelled slice of the VM's used disk (docker images/containers, database, backups,
+// gitea, certificates, logs, other).
+type DiskUsageEntry struct {
+	Name  string `json:"name"`
+	Bytes uint64 `json:"bytes"`
 }
 
 // Condition is one reconcile-condition the agent reports (Kubernetes-style status). Type is one of

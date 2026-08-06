@@ -207,6 +207,9 @@ func toProtoStatusReport(r StatusReport) *agentv1.StatusReport {
 			CpuPercent: r.Host.CPUPercent, MemTotalBytes: r.Host.MemTotalBytes, MemUsedBytes: r.Host.MemUsedBytes,
 			DiskTotalBytes: r.Host.DiskTotalBytes, DiskUsedBytes: r.Host.DiskUsedBytes,
 		}
+		for _, e := range r.Host.DiskBreakdown {
+			out.Host.DiskBreakdown = append(out.Host.DiskBreakdown, &agentv1.DiskUsageEntry{Name: e.Name, Bytes: e.Bytes})
+		}
 	}
 	for _, c := range r.Certificates {
 		out.Certificates = append(out.Certificates, &agentv1.CertReport{Host: c.Host, NotAfter: c.NotAfter, IssuedAt: c.IssuedAt})

@@ -168,6 +168,15 @@ message HostMetrics {
   uint64 mem_used_bytes = 3;
   uint64 disk_total_bytes = 4;
   uint64 disk_used_bytes = 5;
+  // Per-category split of the used disk (docker images/containers, database, backups, gitea, certs, logs,
+  // other) so the cockpit can show WHERE the disk went, not just the total. Sums to ~disk_used_bytes.
+  repeated DiskUsageEntry disk_breakdown = 6;
+}
+
+// DiskUsageEntry is one labelled slice of the VM's on-disk usage.
+message DiskUsageEntry {
+  string name = 1; // docker-images | docker-containers | database | backups | gitea | certificates | logs | other
+  uint64 bytes = 2;
 }
 
 // CertReport is the state of one obtained certificate, reported back to cloud (system of record).

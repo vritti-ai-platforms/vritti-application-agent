@@ -1055,8 +1055,11 @@ type HostMetrics struct {
 	MemUsedBytes   uint64                 `protobuf:"varint,3,opt,name=mem_used_bytes,json=memUsedBytes,proto3" json:"mem_used_bytes,omitempty"`
 	DiskTotalBytes uint64                 `protobuf:"varint,4,opt,name=disk_total_bytes,json=diskTotalBytes,proto3" json:"disk_total_bytes,omitempty"`
 	DiskUsedBytes  uint64                 `protobuf:"varint,5,opt,name=disk_used_bytes,json=diskUsedBytes,proto3" json:"disk_used_bytes,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Per-category split of the used disk (docker images/containers, database, backups, gitea, certs, logs,
+	// other) so the cockpit can show WHERE the disk went, not just the total. Sums to ~disk_used_bytes.
+	DiskBreakdown []*DiskUsageEntry `protobuf:"bytes,6,rep,name=disk_breakdown,json=diskBreakdown,proto3" json:"disk_breakdown,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HostMetrics) Reset() {
@@ -1124,6 +1127,66 @@ func (x *HostMetrics) GetDiskUsedBytes() uint64 {
 	return 0
 }
 
+func (x *HostMetrics) GetDiskBreakdown() []*DiskUsageEntry {
+	if x != nil {
+		return x.DiskBreakdown
+	}
+	return nil
+}
+
+// DiskUsageEntry is one labelled slice of the VM's on-disk usage.
+type DiskUsageEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // docker-images | docker-containers | database | backups | gitea | certificates | logs | other
+	Bytes         uint64                 `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DiskUsageEntry) Reset() {
+	*x = DiskUsageEntry{}
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiskUsageEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiskUsageEntry) ProtoMessage() {}
+
+func (x *DiskUsageEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiskUsageEntry.ProtoReflect.Descriptor instead.
+func (*DiskUsageEntry) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *DiskUsageEntry) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *DiskUsageEntry) GetBytes() uint64 {
+	if x != nil {
+		return x.Bytes
+	}
+	return 0
+}
+
 // CertReport is the state of one obtained certificate, reported back to cloud (system of record).
 type CertReport struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1136,7 +1199,7 @@ type CertReport struct {
 
 func (x *CertReport) Reset() {
 	*x = CertReport{}
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1148,7 +1211,7 @@ func (x *CertReport) String() string {
 func (*CertReport) ProtoMessage() {}
 
 func (x *CertReport) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1161,7 +1224,7 @@ func (x *CertReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CertReport.ProtoReflect.Descriptor instead.
 func (*CertReport) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *CertReport) GetHost() string {
@@ -1201,7 +1264,7 @@ type AcmeChallengeDelegation struct {
 
 func (x *AcmeChallengeDelegation) Reset() {
 	*x = AcmeChallengeDelegation{}
-	mi := &file_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_agent_v1_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1213,7 +1276,7 @@ func (x *AcmeChallengeDelegation) String() string {
 func (*AcmeChallengeDelegation) ProtoMessage() {}
 
 func (x *AcmeChallengeDelegation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_agent_v1_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1226,7 +1289,7 @@ func (x *AcmeChallengeDelegation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcmeChallengeDelegation.ProtoReflect.Descriptor instead.
 func (*AcmeChallengeDelegation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *AcmeChallengeDelegation) GetName() string {
@@ -1277,7 +1340,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_agent_v1_agent_proto_msgTypes[18]
+	mi := &file_agent_v1_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1289,7 +1352,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[18]
+	mi := &file_agent_v1_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1302,7 +1365,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{18}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Event) GetLevel() string {
@@ -1346,7 +1409,7 @@ type LogLine struct {
 
 func (x *LogLine) Reset() {
 	*x = LogLine{}
-	mi := &file_agent_v1_agent_proto_msgTypes[19]
+	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1358,7 +1421,7 @@ func (x *LogLine) String() string {
 func (*LogLine) ProtoMessage() {}
 
 func (x *LogLine) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[19]
+	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1371,7 +1434,7 @@ func (x *LogLine) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogLine.ProtoReflect.Descriptor instead.
 func (*LogLine) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{19}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *LogLine) GetTarget() string {
@@ -1415,7 +1478,7 @@ type LogBatch struct {
 
 func (x *LogBatch) Reset() {
 	*x = LogBatch{}
-	mi := &file_agent_v1_agent_proto_msgTypes[20]
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1427,7 +1490,7 @@ func (x *LogBatch) String() string {
 func (*LogBatch) ProtoMessage() {}
 
 func (x *LogBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[20]
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1440,7 +1503,7 @@ func (x *LogBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogBatch.ProtoReflect.Descriptor instead.
 func (*LogBatch) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{20}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *LogBatch) GetLines() []*LogLine {
@@ -1459,7 +1522,7 @@ type PushLogsAck struct {
 
 func (x *PushLogsAck) Reset() {
 	*x = PushLogsAck{}
-	mi := &file_agent_v1_agent_proto_msgTypes[21]
+	mi := &file_agent_v1_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1471,7 +1534,7 @@ func (x *PushLogsAck) String() string {
 func (*PushLogsAck) ProtoMessage() {}
 
 func (x *PushLogsAck) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[21]
+	mi := &file_agent_v1_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1484,7 +1547,7 @@ func (x *PushLogsAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushLogsAck.ProtoReflect.Descriptor instead.
 func (*PushLogsAck) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{21}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{22}
 }
 
 var File_agent_v1_agent_proto protoreflect.FileDescriptor
@@ -1565,14 +1628,18 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x06health\x18\x05 \x01(\tR\x06health\x12\x1f\n" +
 	"\vcpu_percent\x18\x06 \x01(\x01R\n" +
 	"cpuPercent\x12!\n" +
-	"\fmemory_bytes\x18\a \x01(\x04R\vmemoryBytes\"\xce\x01\n" +
+	"\fmemory_bytes\x18\a \x01(\x04R\vmemoryBytes\"\x8f\x02\n" +
 	"\vHostMetrics\x12\x1f\n" +
 	"\vcpu_percent\x18\x01 \x01(\x01R\n" +
 	"cpuPercent\x12&\n" +
 	"\x0fmem_total_bytes\x18\x02 \x01(\x04R\rmemTotalBytes\x12$\n" +
 	"\x0emem_used_bytes\x18\x03 \x01(\x04R\fmemUsedBytes\x12(\n" +
 	"\x10disk_total_bytes\x18\x04 \x01(\x04R\x0ediskTotalBytes\x12&\n" +
-	"\x0fdisk_used_bytes\x18\x05 \x01(\x04R\rdiskUsedBytes\"Z\n" +
+	"\x0fdisk_used_bytes\x18\x05 \x01(\x04R\rdiskUsedBytes\x12?\n" +
+	"\x0edisk_breakdown\x18\x06 \x03(\v2\x18.agent.v1.DiskUsageEntryR\rdiskBreakdown\":\n" +
+	"\x0eDiskUsageEntry\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05bytes\x18\x02 \x01(\x04R\x05bytes\"Z\n" +
 	"\n" +
 	"CertReport\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x1b\n" +
@@ -1619,7 +1686,7 @@ func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 	return file_agent_v1_agent_proto_rawDescData
 }
 
-var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_agent_v1_agent_proto_goTypes = []any{
 	(*EnrollRequest)(nil),           // 0: agent.v1.EnrollRequest
 	(*EnrollResponse)(nil),          // 1: agent.v1.EnrollResponse
@@ -1637,12 +1704,13 @@ var file_agent_v1_agent_proto_goTypes = []any{
 	(*Condition)(nil),               // 13: agent.v1.Condition
 	(*ServiceStatus)(nil),           // 14: agent.v1.ServiceStatus
 	(*HostMetrics)(nil),             // 15: agent.v1.HostMetrics
-	(*CertReport)(nil),              // 16: agent.v1.CertReport
-	(*AcmeChallengeDelegation)(nil), // 17: agent.v1.AcmeChallengeDelegation
-	(*Event)(nil),                   // 18: agent.v1.Event
-	(*LogLine)(nil),                 // 19: agent.v1.LogLine
-	(*LogBatch)(nil),                // 20: agent.v1.LogBatch
-	(*PushLogsAck)(nil),             // 21: agent.v1.PushLogsAck
+	(*DiskUsageEntry)(nil),          // 16: agent.v1.DiskUsageEntry
+	(*CertReport)(nil),              // 17: agent.v1.CertReport
+	(*AcmeChallengeDelegation)(nil), // 18: agent.v1.AcmeChallengeDelegation
+	(*Event)(nil),                   // 19: agent.v1.Event
+	(*LogLine)(nil),                 // 20: agent.v1.LogLine
+	(*LogBatch)(nil),                // 21: agent.v1.LogBatch
+	(*PushLogsAck)(nil),             // 22: agent.v1.PushLogsAck
 }
 var file_agent_v1_agent_proto_depIdxs = []int32{
 	3,  // 0: agent.v1.ServerMessage.desired_state:type_name -> agent.v1.SignedDesiredState
@@ -1655,23 +1723,24 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	13, // 7: agent.v1.StatusReport.conditions:type_name -> agent.v1.Condition
 	14, // 8: agent.v1.StatusReport.services:type_name -> agent.v1.ServiceStatus
 	15, // 9: agent.v1.StatusReport.host:type_name -> agent.v1.HostMetrics
-	16, // 10: agent.v1.StatusReport.certificates:type_name -> agent.v1.CertReport
-	17, // 11: agent.v1.StatusReport.delegation:type_name -> agent.v1.AcmeChallengeDelegation
-	18, // 12: agent.v1.StatusReport.events:type_name -> agent.v1.Event
-	19, // 13: agent.v1.LogBatch.lines:type_name -> agent.v1.LogLine
-	0,  // 14: agent.v1.AgentService.Enroll:input_type -> agent.v1.EnrollRequest
-	2,  // 15: agent.v1.AgentService.Subscribe:input_type -> agent.v1.SubscribeRequest
-	11, // 16: agent.v1.AgentService.ReportStatus:input_type -> agent.v1.StatusReport
-	20, // 17: agent.v1.AgentService.PushLogs:input_type -> agent.v1.LogBatch
-	1,  // 18: agent.v1.AgentService.Enroll:output_type -> agent.v1.EnrollResponse
-	4,  // 19: agent.v1.AgentService.Subscribe:output_type -> agent.v1.ServerMessage
-	12, // 20: agent.v1.AgentService.ReportStatus:output_type -> agent.v1.ReportAck
-	21, // 21: agent.v1.AgentService.PushLogs:output_type -> agent.v1.PushLogsAck
-	18, // [18:22] is the sub-list for method output_type
-	14, // [14:18] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	17, // 10: agent.v1.StatusReport.certificates:type_name -> agent.v1.CertReport
+	18, // 11: agent.v1.StatusReport.delegation:type_name -> agent.v1.AcmeChallengeDelegation
+	19, // 12: agent.v1.StatusReport.events:type_name -> agent.v1.Event
+	16, // 13: agent.v1.HostMetrics.disk_breakdown:type_name -> agent.v1.DiskUsageEntry
+	20, // 14: agent.v1.LogBatch.lines:type_name -> agent.v1.LogLine
+	0,  // 15: agent.v1.AgentService.Enroll:input_type -> agent.v1.EnrollRequest
+	2,  // 16: agent.v1.AgentService.Subscribe:input_type -> agent.v1.SubscribeRequest
+	11, // 17: agent.v1.AgentService.ReportStatus:input_type -> agent.v1.StatusReport
+	21, // 18: agent.v1.AgentService.PushLogs:input_type -> agent.v1.LogBatch
+	1,  // 19: agent.v1.AgentService.Enroll:output_type -> agent.v1.EnrollResponse
+	4,  // 20: agent.v1.AgentService.Subscribe:output_type -> agent.v1.ServerMessage
+	12, // 21: agent.v1.AgentService.ReportStatus:output_type -> agent.v1.ReportAck
+	22, // 22: agent.v1.AgentService.PushLogs:output_type -> agent.v1.PushLogsAck
+	19, // [19:23] is the sub-list for method output_type
+	15, // [15:19] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_agent_proto_init() }
@@ -1696,7 +1765,7 @@ func file_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

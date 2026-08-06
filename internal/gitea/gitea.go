@@ -8,9 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vritti-ai-platforms/vritti-application-agent/internal/dockerx"
 )
@@ -22,6 +25,9 @@ type state struct {
 
 const containerName = "gitea"
 const tokenName = "vritti-agent-bootstrap"
+
+// giteaInternalURL is the Gitea HTTP API on the shared stack network (the agent joins vritti-core-net).
+const giteaInternalURL = "http://" + containerName + ":3000"
 
 // ProvisionAdminToken ensures a Gitea admin exists and returns a stable admin API token. The admin
 // bootstrap creds come from Infisical's `/agent` folder (never generated).
@@ -37,7 +43,7 @@ func ProvisionAdminToken(ctx context.Context, dx *dockerx.Client, adminUser, adm
 	if err := ensureAdmin(ctx, dx, adminUser, adminPassword); err != nil {
 		return "", err
 	}
-	token, err := generateToken(ctx, dx, adminUser)
+	token, err := generateToken(ctx, dx, adminUser, adminPassword)
 	if err != nil {
 		return "", err
 	}
@@ -68,8 +74,14 @@ func ensureAdmin(ctx context.Context, dx *dockerx.Client, adminUser, adminPasswo
 	return nil
 }
 
-// generateToken mints an all-scopes admin token and returns the raw value.
-func generateToken(ctx context.Context, dx *dockerx.Client, adminUser string) (string, error) {
+// generateToken mints an all-scopes admin token and returns the raw value. It first deletes any token of
+// the same name so it's idempotent: Gitea rejects a duplicate token name and won't hand back an existing
+// secret, so if our cached copy is gone (e.g. the agent state dir was wiped on re-enroll while Gitea's
+// volume kept the token) a plain generate loops forever on "name has been used already".
+func generateToken(ctx context.Context, dx *dockerx.Client, adminUser, adminPassword string) (string, error) {
+	if err := deleteExistingToken(ctx, adminUser, adminPassword); err != nil {
+		return "", err
+	}
 	cmd := giteaCLI(fmt.Sprintf(
 		"gitea admin user generate-access-token --username %s --scopes all --token-name %s --raw",
 		adminUser, tokenName,
@@ -87,6 +99,27 @@ func generateToken(ctx context.Context, dx *dockerx.Client, adminUser string) (s
 		return "", fmt.Errorf("gitea returned an empty token")
 	}
 	return token, nil
+}
+
+// deleteExistingToken removes any admin token named tokenName via the Gitea API (basic auth with the admin
+// creds), so the subsequent generate never collides. 404 (no such token) is treated as success.
+func deleteExistingToken(ctx context.Context, adminUser, adminPassword string) error {
+	url := fmt.Sprintf("%s/api/v1/users/%s/tokens/%s", giteaInternalURL, adminUser, tokenName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(adminUser, adminPassword)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("gitea token delete: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Errorf("gitea token delete failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 // giteaCLI runs a gitea command inside the container as the git user with the right work dir.

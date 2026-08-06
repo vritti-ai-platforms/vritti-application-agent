@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -58,6 +59,35 @@ func New(deploymentID string) (*Client, error) {
 
 // Close releases the underlying HTTP transport.
 func (c *Client) Close() error { return c.api.Close() }
+
+// DiskUsage returns docker's on-disk footprint in bytes: deduped image layers, and the "containers" bucket
+// (writable container layers + volumes + build cache). Mirrors `docker system df`. Our stack uses bind
+// mounts, so volumes/build-cache are ~0 — they're folded into containers so nothing is missed.
+func (c *Client) DiskUsage(ctx context.Context) (images, containers uint64, err error) {
+	du, err := c.api.DiskUsage(ctx, types.DiskUsageOptions{})
+	if err != nil {
+		return 0, 0, err
+	}
+	if du.LayersSize > 0 {
+		images = uint64(du.LayersSize)
+	}
+	var other int64
+	for _, ct := range du.Containers {
+		other += ct.SizeRw
+	}
+	for _, v := range du.Volumes {
+		if v.UsageData != nil && v.UsageData.Size > 0 {
+			other += v.UsageData.Size
+		}
+	}
+	for _, bc := range du.BuildCache {
+		other += bc.Size
+	}
+	if other > 0 {
+		containers = uint64(other)
+	}
+	return images, containers, nil
+}
 
 // HealthSpec is a container-level healthcheck.
 type HealthSpec struct {

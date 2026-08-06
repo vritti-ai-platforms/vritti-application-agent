@@ -40,9 +40,6 @@ func Load() (*Config, error) {
 // KeysDir is where the agent's local keypairs live.
 func (c *Config) KeysDir() string { return filepath.Join(c.DataDir, "keys") }
 
-// SecretsDir is where agent-generated machine secrets are persisted.
-func (c *Config) SecretsDir() string { return filepath.Join(c.DataDir, "secrets") }
-
 // EnrollmentPath is where the completed-enrollment record (deployment pubkey, credential) is cached.
 func (c *Config) EnrollmentPath() string { return filepath.Join(c.DataDir, "enrollment.json") }
 
