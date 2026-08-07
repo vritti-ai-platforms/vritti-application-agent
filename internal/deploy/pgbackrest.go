@@ -28,9 +28,9 @@ var backupS3Keys = []string{"S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_
 
 // Backup mode strings reported to cloud so the admin UI can show whether offsite is configured.
 const (
-	BackupModeOff     = "off"           // backups add-on disabled
-	BackupModeLocal   = "local"         // repo1 only (encrypted, on the VM disk)
-	BackupModeOffsite = "local+offsite" // repo1 + encrypted repo2 on an S3-compatible store
+	BackupStateOff     = "off"           // backups add-on disabled
+	BackupStateLocal   = "local"         // repo1 only (encrypted, on the VM disk)
+	BackupStateOffsite = "local+offsite" // repo1 + encrypted repo2 on an S3-compatible store
 )
 
 // ValidateBackupSecrets checks the `/backup` folder has everything pgBackRest needs BEFORE the stanza is
@@ -55,14 +55,14 @@ func ValidateBackupSecrets(env map[string]string) error {
 	return nil
 }
 
-// BackupMode reports the configured backup topology so cloud/UI can show it. Assumes ValidateBackupSecrets
+// BackupState reports the configured backup topology so cloud/UI can show it. Assumes ValidateBackupSecrets
 // passed: repo1 is always present, and offsite repo2 is on exactly when its cipher passphrase (+ S3 creds)
-// is set. Returns BackupModeLocal or BackupModeOffsite.
-func BackupMode(env map[string]string) string {
+// is set. Returns BackupStateLocal or BackupStateOffsite.
+func BackupState(env map[string]string) string {
 	if strings.TrimSpace(env[BackupRepo2CipherPass]) != "" {
-		return BackupModeOffsite
+		return BackupStateOffsite
 	}
-	return BackupModeLocal
+	return BackupStateLocal
 }
 
 // pgbackrest commands run as the postgres OS user inside the Postgres container (it owns PGDATA

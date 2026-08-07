@@ -231,7 +231,7 @@ func toProtoStatusReport(r StatusReport) *agentv1.StatusReport {
 	for _, e := range r.Events {
 		out.Events = append(out.Events, &agentv1.Event{Level: e.Level, Component: e.Component, Reason: e.Reason, Message: e.Message})
 	}
-	out.BackupMode = r.BackupMode
+	out.BackupState = r.BackupState
 	return out
 }
 

@@ -74,7 +74,7 @@ type Agent struct {
 	lastGeneration int64
 	lastDesired    *cloudapi.DesiredState // last verified desired-state — re-applied on force-recheck / blocked self-heal
 	archiving      bool                   // pgBackRest add-on currently enabled (drives the backup ticker)
-	backupMode     string                 // "off" | "local" | "local+offsite" — reported to cloud for the UI
+	backupState    string                 // "off" | "local" | "local+offsite" — reported to cloud for the UI
 	hadFullBackup  bool                   // a full backup has been taken since archiving was enabled
 	edgeManaged    bool                   // agent runs nginx + the bundled acme-dns wildcard edge
 	certs          []cloudapi.CertReport  // last observed managed-edge certs (reported each heartbeat)
@@ -133,7 +133,7 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 		cfg: cfg, log: log, keys: keys, dx: dx, cloud: cloud,
 		forceRecheckCh: make(chan struct{}, 1),
 		recreateCh:     make(chan string, 8),
-		backupMode:     deploy.BackupModeOff, // until the first reconcile determines the real mode
+		backupState:    deploy.BackupStateOff, // until the first reconcile determines the real mode
 	}, nil
 }
 
@@ -799,7 +799,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// (7) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
 	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
 	archiving := pgBackRest
-	a.backupMode = deploy.BackupModeOff // reset; set to the configured topology below once backups are validated
+	a.backupState = deploy.BackupStateOff // reset; set to the configured topology below once backups are validated
 	if dbManaged {
 		a.step(ds.Generation, "database", "ProvisioningDatabase", "Provisioning the managed Postgres database.")
 		if archiving {
@@ -818,7 +818,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 			if err := deploy.ValidateBackupSecrets(backupEnv); err != nil {
 				return err
 			}
-			a.backupMode = deploy.BackupMode(backupEnv) // "local" or "local+offsite" — reported to cloud
+			a.backupState = deploy.BackupState(backupEnv) // "local" or "local+offsite" — reported to cloud
 			confDir := deploy.PgBackRestConfDir(a.cfg.StackRoot)
 			confPath := filepath.Join(confDir, "pgbackrest.conf")
 			conf := deploy.RenderPgBackRestConf(ds, backupEnv, db.OwnerUser)
@@ -994,7 +994,7 @@ func (a *Agent) report(ctx context.Context, generation int64, conditions []cloud
 		Certificates: a.certs,
 		Delegation:   a.acmeDelegation,
 		Events:       events,
-		BackupMode:   a.backupMode,
+		BackupState:  a.backupState,
 		Host: &cloudapi.HostMetrics{
 			CPUPercent:     hm.CPUPercent,
 			MemTotalBytes:  hm.MemTotalBytes,

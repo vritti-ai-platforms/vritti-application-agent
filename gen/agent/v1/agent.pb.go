@@ -798,14 +798,14 @@ func (x *Recreate) GetService() string {
 type StatusReport struct {
 	state         protoimpl.MessageState   `protogen:"open.v1"`
 	DeploymentId  string                   `protobuf:"bytes,1,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
-	Generation    int64                    `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`                  // desired-state generation currently applied
-	Conditions    []*Condition             `protobuf:"bytes,3,rep,name=conditions,proto3" json:"conditions,omitempty"`                   // reconcile conditions observed by the agent
-	Services      []*ServiceStatus         `protobuf:"bytes,4,rep,name=services,proto3" json:"services,omitempty"`                       // per-service runtime states, tagged by component
-	Host          *HostMetrics             `protobuf:"bytes,5,opt,name=host,proto3" json:"host,omitempty"`                               // whole-VM resource usage (optional)
-	Certificates  []*CertReport            `protobuf:"bytes,6,rep,name=certificates,proto3" json:"certificates,omitempty"`               // managed-edge cert expiries (cloud is system of record)
-	Delegation    *AcmeChallengeDelegation `protobuf:"bytes,7,opt,name=delegation,proto3" json:"delegation,omitempty"`                   // one-time DNS the operator must add (present while blocked)
-	Events        []*Event                 `protobuf:"bytes,8,rep,name=events,proto3" json:"events,omitempty"`                           // notable transitions to record on the deployment timeline
-	BackupMode    string                   `protobuf:"bytes,9,opt,name=backup_mode,json=backupMode,proto3" json:"backup_mode,omitempty"` // managed-DB backups: "off" | "local" | "local+offsite"
+	Generation    int64                    `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`                     // desired-state generation currently applied
+	Conditions    []*Condition             `protobuf:"bytes,3,rep,name=conditions,proto3" json:"conditions,omitempty"`                      // reconcile conditions observed by the agent
+	Services      []*ServiceStatus         `protobuf:"bytes,4,rep,name=services,proto3" json:"services,omitempty"`                          // per-service runtime states, tagged by component
+	Host          *HostMetrics             `protobuf:"bytes,5,opt,name=host,proto3" json:"host,omitempty"`                                  // whole-VM resource usage (optional)
+	Certificates  []*CertReport            `protobuf:"bytes,6,rep,name=certificates,proto3" json:"certificates,omitempty"`                  // managed-edge cert expiries (cloud is system of record)
+	Delegation    *AcmeChallengeDelegation `protobuf:"bytes,7,opt,name=delegation,proto3" json:"delegation,omitempty"`                      // one-time DNS the operator must add (present while blocked)
+	Events        []*Event                 `protobuf:"bytes,8,rep,name=events,proto3" json:"events,omitempty"`                              // notable transitions to record on the deployment timeline
+	BackupState   string                   `protobuf:"bytes,9,opt,name=backup_state,json=backupState,proto3" json:"backup_state,omitempty"` // managed-DB backups: "off" | "local" | "local+offsite"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -896,9 +896,9 @@ func (x *StatusReport) GetEvents() []*Event {
 	return nil
 }
 
-func (x *StatusReport) GetBackupMode() string {
+func (x *StatusReport) GetBackupState() string {
 	if x != nil {
-		return x.BackupMode
+		return x.BackupState
 	}
 	return ""
 }
@@ -1670,7 +1670,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\bStopLogs\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\"$\n" +
 	"\bRecreate\x12\x18\n" +
-	"\aservice\x18\x01 \x01(\tR\aservice\"\xaf\x03\n" +
+	"\aservice\x18\x01 \x01(\tR\aservice\"\xb1\x03\n" +
 	"\fStatusReport\x12#\n" +
 	"\rdeployment_id\x18\x01 \x01(\tR\fdeploymentId\x12\x1e\n" +
 	"\n" +
@@ -1685,9 +1685,8 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"delegation\x18\a \x01(\v2!.agent.v1.AcmeChallengeDelegationR\n" +
 	"delegation\x12'\n" +
-	"\x06events\x18\b \x03(\v2\x0f.agent.v1.EventR\x06events\x12\x1f\n" +
-	"\vbackup_mode\x18\t \x01(\tR\n" +
-	"backupMode\"\v\n" +
+	"\x06events\x18\b \x03(\v2\x0f.agent.v1.EventR\x06events\x12!\n" +
+	"\fbackup_state\x18\t \x01(\tR\vbackupState\"\v\n" +
 	"\tReportAck\"\x9d\x01\n" +
 	"\tCondition\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x16\n" +
