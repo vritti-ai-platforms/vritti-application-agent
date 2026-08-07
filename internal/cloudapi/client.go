@@ -256,6 +256,7 @@ func toProtoStatusReport(r StatusReport) *agentv1.StatusReport {
 			bi.Backups = append(bi.Backups, &agentv1.BackupEntry{
 				Label: b.Label, Type: b.Type, StartUnix: b.StartUnix, StopUnix: b.StopUnix,
 				SizeBytes: b.SizeBytes, RepoBytes: b.RepoBytes,
+				Timeline: int32(b.Timeline), Trigger: b.Trigger,
 			})
 		}
 		out.BackupInfo = bi

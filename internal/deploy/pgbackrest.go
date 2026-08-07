@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,9 @@ import (
 
 // StanzaName is the pgBackRest stanza for the core database.
 const StanzaName = "core"
+
+// PostgresPGDataDir is the in-container PGDATA path (matches pg1-path in the config and PGDATA in PostgresSpec).
+const PostgresPGDataDir = "/var/lib/postgresql/data/pgdata"
 
 // Backup secret keys sourced from the `/backup` secret-store folder. Both cipher passphrases live in the
 // secret store (NOT on the VM): a VM-local key would make the OFFSITE repo2 backups unrecoverable after a
@@ -159,11 +163,30 @@ type pgbrStanzaInfo struct {
 				Delta uint64 `json:"delta"`
 			} `json:"repository"`
 		} `json:"info"`
+		// Archive.Start is the first WAL segment of the backup; its leading 8 hex chars are the timeline id.
+		Archive struct {
+			Start string `json:"start"`
+		} `json:"archive"`
+		// Annotation carries our own tags (trigger=scheduled|manual|initial); absent on older pgBackRest.
+		Annotation map[string]string `json:"annotation"`
 	} `json:"backup"`
 }
 
-// CollectBackupInfo runs `pgbackrest info --output=json` inside Postgres and parses the core stanza's backup
-// inventory (label, type, timestamps, sizes) for the admin UI's backup timeline + recovery window.
+// parseTimeline extracts the timeline id from a WAL segment name (its leading 8 hex chars). 0 if unparseable.
+func parseTimeline(walStart string) int {
+	if len(walStart) < 8 {
+		return 0
+	}
+	tl, err := strconv.ParseInt(walStart[:8], 16, 32)
+	if err != nil {
+		return 0
+	}
+	return int(tl)
+}
+
+// CollectBackupInfo runs `pgbackrest info --output=json` inside the running Postgres container and parses the
+// core stanza's backup inventory for the admin UI's timeline + recovery window. Use CollectBackupInfoOffline
+// when the deployment is stopped (Postgres removed).
 func CollectBackupInfo(ctx context.Context, dx *dockerx.Client) (*cloudapi.BackupInfo, error) {
 	code, out, err := dx.Exec(ctx, SvcPostgres, pgbackrestExec("info --output=json"))
 	if err != nil {
@@ -172,6 +195,40 @@ func CollectBackupInfo(ctx context.Context, dx *dockerx.Client) (*cloudapi.Backu
 	if code != 0 {
 		return nil, fmt.Errorf("pgbackrest info failed (exit %d): %s", code, out)
 	}
+	return parseBackupInfo(out)
+}
+
+// CollectBackupInfoOffline reads the same inventory WITHOUT a running Postgres — it runs `pgbackrest info` in a
+// one-off container that mounts the repo + config read-only. `info` reads the repository (not the live cluster),
+// so the backup list stays visible while the deployment is stopped.
+func CollectBackupInfoOffline(ctx context.Context, dx *dockerx.Client, image, stackRoot string) (*cloudapi.BackupInfo, error) {
+	code, out, err := dx.RunToCompletion(ctx, InfoSpec(image, stackRoot))
+	if err != nil {
+		return nil, fmt.Errorf("pgbackrest info (offline) run: %w", err)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("pgbackrest info (offline) failed (exit %d): %s", code, out)
+	}
+	return parseBackupInfo(out)
+}
+
+// InfoSpec is the one-off container that reads the pgBackRest inventory offline (repo + config, read-only).
+func InfoSpec(image, stackRoot string) dockerx.RunSpec {
+	return dockerx.RunSpec{
+		Name:    SvcPostgresInfo,
+		Service: SvcPostgresInfo,
+		Image:   image,
+		Cmd:     []string{"su", "postgres", "-c", "pgbackrest --stanza=" + StanzaName + " info --output=json"},
+		Binds: []string{
+			filepath.Join(stackRoot, "pgbackrest") + ":/etc/pgbackrest:ro",
+			filepath.Join(stackRoot, "backup") + ":/var/lib/pgbackrest:ro",
+		},
+		Network: Network,
+	}
+}
+
+// parseBackupInfo turns `pgbackrest info --output=json` output into the core stanza's backup inventory.
+func parseBackupInfo(out string) (*cloudapi.BackupInfo, error) {
 	// pgBackRest may emit a warning line before the JSON payload — start at the first '['.
 	start := strings.IndexByte(out, '[')
 	if start < 0 {
@@ -187,6 +244,10 @@ func CollectBackupInfo(ctx context.Context, dx *dockerx.Client) (*cloudapi.Backu
 			continue
 		}
 		for _, b := range st.Backup {
+			trigger := b.Annotation["trigger"]
+			if trigger == "" {
+				trigger = BackupTriggerScheduled // older pgBackRest (no annotations) or an un-tagged backup
+			}
 			info.Backups = append(info.Backups, cloudapi.BackupEntry{
 				Label:     b.Label,
 				Type:      b.Type,
@@ -194,6 +255,8 @@ func CollectBackupInfo(ctx context.Context, dx *dockerx.Client) (*cloudapi.Backu
 				StopUnix:  b.Timestamp.Stop,
 				SizeBytes: b.Info.Size,
 				RepoBytes: b.Info.Repository.Delta,
+				Timeline:  parseTimeline(b.Archive.Start),
+				Trigger:   trigger,
 			})
 		}
 	}
@@ -202,6 +265,9 @@ func CollectBackupInfo(ctx context.Context, dx *dockerx.Client) (*cloudapi.Backu
 
 // SvcPostgresRestore is the one-off container that runs the offline pgBackRest restore into PGDATA.
 const SvcPostgresRestore = "core-db-restore"
+
+// SvcPostgresInfo is the one-off container that reads the pgBackRest inventory when Postgres isn't running.
+const SvcPostgresInfo = "core-db-info"
 
 // pgRestoreTargetTime converts an RFC3339 instant into the timestamp format pgBackRest/Postgres recovery
 // expects ("2006-01-02 15:04:05-07:00"). A value that doesn't parse is passed through unchanged.
@@ -219,7 +285,11 @@ func pgRestoreTargetTime(rfc3339 string) string {
 //   - setLabel   -> --set=<label> --type=immediate --target-action=promote (that backup's consistency point)
 //   - neither     -> latest backup, recover to the end of the WAL archive
 func pgRestoreCommand(targetTime, setLabel string) []string {
-	args := "pgbackrest --stanza=" + StanzaName + " --delta"
+	// The live Postgres container is force-removed before the restore, which leaves a stale postmaster.pid in
+	// PGDATA — pgBackRest refuses ("unable to restore while PostgreSQL is running", exit 38) unless it's gone.
+	// Safe to delete here: no Postgres process is running (its container was removed), exactly the case the
+	// pgBackRest hint says to remove it in.
+	args := "rm -f " + PostgresPGDataDir + "/postmaster.pid && pgbackrest --stanza=" + StanzaName + " --delta"
 	switch {
 	case targetTime != "":
 		args += fmt.Sprintf(` --type=time "--target=%s" --target-action=promote`, pgRestoreTargetTime(targetTime))
@@ -248,9 +318,41 @@ func RestoreSpec(image, stackRoot, targetTime, setLabel string) dockerx.RunSpec 
 	}
 }
 
-// RunBackup runs a pgBackRest backup of the given type ("full" or "incr") inside Postgres.
-func RunBackup(ctx context.Context, dx *dockerx.Client, backupType string) error {
-	code, out, err := dx.Exec(ctx, SvcPostgres, pgbackrestExec("--type="+backupType+" backup"))
+// Backup trigger tags (stored as a pgBackRest annotation so the UI can tell auto from manual backups apart).
+const (
+	BackupTriggerScheduled = "scheduled" // hourly incr / daily full ticker
+	BackupTriggerManual    = "manual"    // operator pressed "Backup now"
+	BackupTriggerInitial   = "initial"   // first full taken when backups were enabled
+)
+
+// SupportsBackupAnnotations reports whether the Postgres image's pgBackRest is new enough (>= 2.41) to accept
+// `--annotation`. Passing that flag to an older binary would FAIL the backup, so the agent probes once and
+// only tags when supported; an older binary just leaves every backup tagged "scheduled".
+func SupportsBackupAnnotations(ctx context.Context, dx *dockerx.Client) bool {
+	code, out, err := dx.Exec(ctx, SvcPostgres, []string{"pgbackrest", "version"})
+	if err != nil || code != 0 {
+		return false
+	}
+	fields := strings.Fields(out) // e.g. "pgBackRest 2.50"
+	if len(fields) < 2 {
+		return false
+	}
+	var major, minor int
+	if _, err := fmt.Sscanf(fields[len(fields)-1], "%d.%d", &major, &minor); err != nil {
+		return false
+	}
+	return major > 2 || (major == 2 && minor >= 41)
+}
+
+// RunBackup runs a pgBackRest backup of the given type ("full"|"diff"|"incr") inside Postgres, tagging it with
+// its trigger (scheduled|manual|initial) via an annotation when the binary supports it (see SupportsBackupAnnotations).
+func RunBackup(ctx context.Context, dx *dockerx.Client, backupType, trigger string, annotate bool) error {
+	args := "--type=" + backupType
+	if annotate && trigger != "" {
+		args += " --annotation=trigger=" + trigger
+	}
+	args += " backup"
+	code, out, err := dx.Exec(ctx, SvcPostgres, pgbackrestExec(args))
 	if err != nil {
 		return fmt.Errorf("%s backup exec: %w", backupType, err)
 	}

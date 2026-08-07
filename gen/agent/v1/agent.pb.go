@@ -1102,6 +1102,8 @@ type BackupEntry struct {
 	StopUnix      int64                  `protobuf:"varint,4,opt,name=stop_unix,json=stopUnix,proto3" json:"stop_unix,omitempty"`    // backup stop (unix seconds)
 	SizeBytes     uint64                 `protobuf:"varint,5,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // logical database size of the backup set
 	RepoBytes     uint64                 `protobuf:"varint,6,opt,name=repo_bytes,json=repoBytes,proto3" json:"repo_bytes,omitempty"` // compressed size stored in the repository
+	Timeline      int32                  `protobuf:"varint,7,opt,name=timeline,proto3" json:"timeline,omitempty"`                    // Postgres timeline id (branches on each restore/promote)
+	Trigger       string                 `protobuf:"bytes,8,opt,name=trigger,proto3" json:"trigger,omitempty"`                       // scheduled | manual | initial
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1176,6 +1178,20 @@ func (x *BackupEntry) GetRepoBytes() uint64 {
 		return x.RepoBytes
 	}
 	return 0
+}
+
+func (x *BackupEntry) GetTimeline() int32 {
+	if x != nil {
+		return x.Timeline
+	}
+	return 0
+}
+
+func (x *BackupEntry) GetTrigger() string {
+	if x != nil {
+		return x.Trigger
+	}
+	return ""
 }
 
 // ReportAck is the (empty) heartbeat acknowledgement.
@@ -1977,7 +1993,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"backupInfo\"=\n" +
 	"\n" +
 	"BackupInfo\x12/\n" +
-	"\abackups\x18\x01 \x03(\v2\x15.agent.v1.BackupEntryR\abackups\"\xb1\x01\n" +
+	"\abackups\x18\x01 \x03(\v2\x15.agent.v1.BackupEntryR\abackups\"\xe7\x01\n" +
 	"\vBackupEntry\x12\x14\n" +
 	"\x05label\x18\x01 \x01(\tR\x05label\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x1d\n" +
@@ -1987,7 +2003,9 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"size_bytes\x18\x05 \x01(\x04R\tsizeBytes\x12\x1d\n" +
 	"\n" +
-	"repo_bytes\x18\x06 \x01(\x04R\trepoBytes\"\v\n" +
+	"repo_bytes\x18\x06 \x01(\x04R\trepoBytes\x12\x1a\n" +
+	"\btimeline\x18\a \x01(\x05R\btimeline\x12\x18\n" +
+	"\atrigger\x18\b \x01(\tR\atrigger\"\v\n" +
 	"\tReportAck\"\x9d\x01\n" +
 	"\tCondition\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x16\n" +

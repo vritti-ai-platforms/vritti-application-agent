@@ -180,6 +180,8 @@ message BackupEntry {
   int64 stop_unix = 4;   // backup stop (unix seconds)
   uint64 size_bytes = 5; // logical database size of the backup set
   uint64 repo_bytes = 6; // compressed size stored in the repository
+  int32 timeline = 7;    // Postgres timeline id (branches on each restore/promote)
+  string trigger = 8;    // scheduled | manual | initial
 }
 
 // ReportAck is the (empty) heartbeat acknowledgement.

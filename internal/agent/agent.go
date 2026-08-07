@@ -75,8 +75,10 @@ type Agent struct {
 	lastDesired    *cloudapi.DesiredState // last verified desired-state — re-applied on force-recheck / blocked self-heal
 	archiving      bool                   // pgBackRest add-on currently enabled (drives the backup ticker)
 	stopped        bool                   // deployment taken offline by the operator — stack torn down, self-heal + scheduled backups suspended
+	restoring      bool                   // a DESTRUCTIVE restore is in flight — reconcile is suspended so it can't start Postgres mid-restore
 	backupState    string                 // "off" | "local" | "local+offsite" — reported to cloud for the UI
 	backupInfo     *cloudapi.BackupInfo   // last pgBackRest inventory (nil when backups are off / DB stopped)
+	backupAnnotate bool                   // pgBackRest supports --annotation (>=2.41) — probed once, tags backups by trigger
 	hadFullBackup  bool                   // a full backup has been taken since archiving was enabled
 	edgeManaged    bool                   // agent runs nginx + the bundled acme-dns wildcard edge
 	certs          []cloudapi.CertReport  // last observed managed-edge certs (reported each heartbeat)
@@ -349,6 +351,9 @@ func (a *Agent) handleServerEvent(ctx context.Context, ev *cloudapi.ServerEvent)
 		}
 		if ev.Command.RestoreDB != nil {
 			a.log.Info("restore-db command received", "targetTime", ev.Command.RestoreDB.TargetTime, "set", ev.Command.RestoreDB.SetLabel)
+			// Mark restoring NOW (synchronously) so the cloud's follow-up "active" desired-state — pushed to
+			// auto-start the stack after the restore — is held off by applyDesired until the restore finishes.
+			a.restoring = true
 			a.requestRestore(restoreReq{targetTime: ev.Command.RestoreDB.TargetTime, setLabel: ev.Command.RestoreDB.SetLabel})
 		}
 	case ev.KeepAlive:
@@ -375,6 +380,14 @@ func (a *Agent) applySigned(ctx context.Context, signed *cloudapi.SignedDesiredS
 // status. Reconcile runs on a new generation, a lingering error, or the resync cadence — but not inside a
 // backoff window (a genuine failure / LE rate-limit), so we never hammer.
 func (a *Agent) applyDesired(ctx context.Context, ds cloudapi.DesiredState) {
+	// A restore is in flight: keep the last verified desired-state but do NOT reconcile — otherwise the
+	// auto-start "active" push would bring Postgres up on top of the in-progress restore. runRestore reconciles
+	// toward this state itself once it finishes.
+	if a.restoring {
+		services := a.collectServices(ctx)
+		a.report(ctx, a.lastGeneration, a.buildConditions(a.lastReconcileErr, services), services)
+		return
+	}
 	now := time.Now()
 	inBackoff := a.backoff > 0 && now.Before(a.nextAttempt)
 	if !inBackoff && (ds.Generation != a.lastGeneration || a.lastReconcileErr != nil || now.Sub(a.lastResync) >= resyncInterval) {
@@ -425,7 +438,7 @@ func (a *Agent) runScheduledBackup(ctx context.Context, tick *int) {
 	if *tick%24 == 0 {
 		bt = "full"
 	}
-	if err := deploy.RunBackup(ctx, a.dx, bt); err != nil {
+	if err := deploy.RunBackup(ctx, a.dx, bt, deploy.BackupTriggerScheduled, a.backupAnnotate); err != nil {
 		a.log.Warn("scheduled backup failed", "type", bt, "err", err)
 		a.emit("warn", "database", "BackupFailed", fmt.Sprintf("Scheduled %s backup failed: %v", bt, err))
 	} else {
@@ -457,7 +470,7 @@ func (a *Agent) runOnDemandBackup(ctx context.Context, backupType string) {
 	}
 	a.emit("info", "database", "BackupStarted", fmt.Sprintf("On-demand %s backup started.", backupType))
 	a.reportHeartbeat(ctx)
-	if err := deploy.RunBackup(ctx, a.dx, backupType); err != nil {
+	if err := deploy.RunBackup(ctx, a.dx, backupType, deploy.BackupTriggerManual, a.backupAnnotate); err != nil {
 		a.log.Warn("on-demand backup failed", "type", backupType, "err", err)
 		a.emit("error", "database", "BackupFailed", fmt.Sprintf("On-demand %s backup failed: %v", backupType, err))
 	} else {
@@ -483,33 +496,43 @@ func (a *Agent) requestRestore(req restoreReq) {
 	}
 }
 
-// runRestore performs a DESTRUCTIVE database restore, synchronously in the Run loop so it never overlaps a
-// reconcile: it takes the DB + the app services that hold connections offline, runs an offline delta
-// pgBackRest restore in a one-off container, then reconciles the stack back up recovered to the target.
+// runRestore performs a DESTRUCTIVE database restore, synchronously in the Run loop. The deployment is expected
+// to be stopped first (the cloud enforces it and flips the deployment back to "active" as part of the request),
+// so Postgres is already down and the restore has exclusive access to PGDATA. It runs an offline delta
+// pgBackRest restore in a one-off container; the deferred reapply then reconciles the stack up recovered.
 func (a *Agent) runRestore(ctx context.Context, req restoreReq) {
-	if a.stopped {
-		a.emit("warn", "database", "RestoreSkipped", "Restore requested while the deployment is stopped — start it first.")
-		a.reportHeartbeat(ctx)
-		return
-	}
-	if !a.archiving || a.lastDesired == nil {
-		a.emit("warn", "database", "RestoreSkipped", "Restore requested, but backups are not enabled for this database.")
-		a.reportHeartbeat(ctx)
+	// Whatever the outcome, release the restore lock and reconcile toward the current desired-state — the cloud
+	// has flipped the deployment to "active", so this brings the stack back online (restored, or on the
+	// pre-restore data if the restore failed).
+	defer func() {
+		a.restoring = false
+		a.reapply(ctx)
+	}()
+
+	if a.lastDesired == nil {
 		return
 	}
 	ds := *a.lastDesired
+	hasBackups := ds.Components.Database != nil &&
+		ds.Components.Database.Mode != cloudapi.ModeExternal &&
+		ds.Components.Database.Backup != nil
+	if !hasBackups {
+		a.emit("warn", "database", "RestoreSkipped", "Restore requested, but backups are not enabled for this database.")
+		return
+	}
+
 	target := "the latest backup"
 	if req.targetTime != "" {
 		target = "point-in-time " + req.targetTime
 	} else if req.setLabel != "" {
 		target = "backup " + req.setLabel
 	}
-	a.emit("warn", "database", "RestoreStarted", fmt.Sprintf("Restoring the database to %s — the stack is going offline briefly.", target))
-	a.step(ds.Generation, "database", "RestoringDatabase", "Restoring the database — taking services offline.")
+	a.emit("warn", "database", "RestoreStarted", fmt.Sprintf("Restoring the database to %s. The deployment will come back online when it completes.", target))
+	a.step(ds.Generation, "database", "RestoringDatabase", "Restoring the database.")
 	a.reportHeartbeat(ctx)
 
-	// Take the DB and its connection holders offline so the restore has exclusive access to PGDATA. Data on the
-	// bind-mounts persists; the reconcile below recreates them. Ignore "no such container" (already gone).
+	// Ensure the DB + its connection holders are down (a no-op when the deployment is already stopped) so the
+	// restore has exclusive access to PGDATA. Ignore "no such container" (already gone).
 	for _, svc := range []string{deploy.SvcCore, deploy.SvcCommerce, deploy.SvcPostgres} {
 		if err := a.dx.Remove(ctx, svc); err != nil {
 			a.log.Warn("stop container for restore failed", "service", svc, "err", err)
@@ -521,27 +544,10 @@ func (a *Agent) runRestore(ctx context.Context, req restoreReq) {
 	code, out, err := a.dx.RunToCompletion(ctx, spec)
 	if err != nil || code != 0 {
 		a.log.Error("restore failed", "err", err, "code", code, "out", tailLog(out))
-		a.emit("error", "database", "RestoreFailed", fmt.Sprintf("Database restore to %s failed. The stack is being brought back up on the pre-restore data.", target))
-		// Fall through to reconcile so the stack comes back regardless (Postgres recovers on the existing PGDATA).
+		a.emit("error", "database", "RestoreFailed", fmt.Sprintf("Database restore to %s failed — see the agent logs. The deployment is being brought back up on the pre-restore data.", target))
+		return
 	}
-
-	// Bring the whole stack back up, bypassing the generation gate — Postgres recovers to the target on start,
-	// then the app services + migrations follow. reconcile owns lastGeneration/backoff bookkeeping.
-	rerr := a.reconcile(ctx, ds)
-	a.lastReconcileErr = rerr
-	if rerr != nil {
-		a.log.Error("reconcile after restore failed", "err", rerr)
-		a.emitError(rerr.Error())
-		a.enterBackoff()
-	} else {
-		a.lastErrMsg = ""
-		if err == nil && code == 0 {
-			a.emit("info", "database", "RestoreComplete", fmt.Sprintf("Database restored to %s and back online.", target))
-		}
-	}
-	a.refreshBackupInfo(ctx)
-	services := a.collectServices(ctx)
-	a.report(ctx, a.lastGeneration, a.buildConditions(a.lastReconcileErr, services), services)
+	a.emit("info", "database", "RestoreComplete", fmt.Sprintf("Database restored to %s. Bringing the deployment back online.", target))
 }
 
 // refreshBackupInfo re-reads the pgBackRest inventory into a.backupInfo (cleared when backups are off).
@@ -750,8 +756,18 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 		}
 		a.stopped = true
 		a.archiving = false // no scheduled backups while the database is down
-		a.backupInfo = nil   // the DB is offline; drop the stale backup inventory
-		a.certs = nil        // nothing is being served; drop the stale managed-edge cert snapshot
+		// Keep the backup inventory visible while stopped — read it OFFLINE (Postgres is torn down) so the
+		// operator can pick a backup to restore from. Only when this deployment has backups configured.
+		if ds.Components.Database != nil && ds.Components.Database.Mode != cloudapi.ModeExternal && ds.Components.Database.Backup != nil {
+			if info, err := deploy.CollectBackupInfoOffline(ctx, a.dx, ds.Images.Postgres, a.cfg.StackRoot); err != nil {
+				a.log.Warn("collect backup info (offline) failed", "err", err)
+			} else {
+				a.backupInfo = info
+			}
+		} else {
+			a.backupInfo = nil
+		}
+		a.certs = nil // nothing is being served; drop the stale managed-edge cert snapshot
 		a.acmeDelegation = nil
 		a.curBlockReason = ""
 		a.resetBackoff()
@@ -778,7 +794,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	if dbExternal && a.archiving {
 		a.archiving = false
 		a.step(ds.Generation, "database", "FinalBackup", "Taking a final full backup before removing the managed database.")
-		if err := deploy.RunBackup(ctx, a.dx, "full"); err != nil {
+		if err := deploy.RunBackup(ctx, a.dx, "full", deploy.BackupTriggerScheduled, a.backupAnnotate); err != nil {
 			a.log.Warn("final backup before managed→external teardown failed", "err", err)
 			a.emit("warn", "database", "FinalBackupFailed", fmt.Sprintf("Final backup before removing the managed database failed: %v", err))
 		} else {
@@ -1024,8 +1040,10 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 			if err := deploy.EnsureStanza(ctx, a.dx); err != nil {
 				return err
 			}
+			// Probe once whether pgBackRest can tag backups by trigger (auto vs manual) via annotations.
+			a.backupAnnotate = deploy.SupportsBackupAnnotations(ctx, a.dx)
 			if !a.hadFullBackup {
-				if err := deploy.RunBackup(ctx, a.dx, "full"); err != nil {
+				if err := deploy.RunBackup(ctx, a.dx, "full", deploy.BackupTriggerInitial, a.backupAnnotate); err != nil {
 					return err
 				}
 				a.hadFullBackup = true

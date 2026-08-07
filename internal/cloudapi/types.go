@@ -271,4 +271,6 @@ type BackupEntry struct {
 	StopUnix  int64  `json:"stopUnix"`  // backup stop (unix seconds)
 	SizeBytes uint64 `json:"sizeBytes"` // logical database size of the backup set
 	RepoBytes uint64 `json:"repoBytes"` // compressed bytes this backup added to the repository
+	Timeline  int    `json:"timeline"`  // Postgres timeline id (branches on each restore/promote)
+	Trigger   string `json:"trigger"`   // scheduled | manual | initial (from a pgBackRest annotation)
 }
