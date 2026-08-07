@@ -134,11 +134,25 @@ type Command struct {
 	StartLogs     *StartLogs
 	StopLogs      *StopLogs
 	Recreate      *Recreate
+	RunBackup     *RunBackup
+	RestoreDB     *RestoreDB
 }
 
 // Recreate asks the agent to recreate one service's container so it picks up the latest env/secrets.
 type Recreate struct {
 	Service string
+}
+
+// RunBackup asks the agent to take an on-demand pgBackRest backup of the given type ("full"|"diff"|"incr").
+type RunBackup struct {
+	Type string
+}
+
+// RestoreDB asks the agent to restore the managed database (DESTRUCTIVE). TargetTime = PITR instant (RFC3339);
+// SetLabel = a specific backup set; both empty = restore latest to end of WAL.
+type RestoreDB struct {
+	TargetTime string
+	SetLabel   string
 }
 
 // StartLogs asks the agent to tail one container ("agent" or a service name) and stream its lines up.
@@ -191,6 +205,10 @@ func mapCommand(c *agentv1.Command) *Command {
 		return &Command{StopLogs: &StopLogs{Target: k.StopLogs.Target}}
 	case *agentv1.Command_Recreate:
 		return &Command{Recreate: &Recreate{Service: k.Recreate.Service}}
+	case *agentv1.Command_RunBackup:
+		return &Command{RunBackup: &RunBackup{Type: k.RunBackup.Type}}
+	case *agentv1.Command_RestoreDb:
+		return &Command{RestoreDB: &RestoreDB{TargetTime: k.RestoreDb.TargetTime, SetLabel: k.RestoreDb.SetLabel}}
 	default:
 		return &Command{}
 	}
@@ -232,6 +250,16 @@ func toProtoStatusReport(r StatusReport) *agentv1.StatusReport {
 		out.Events = append(out.Events, &agentv1.Event{Level: e.Level, Component: e.Component, Reason: e.Reason, Message: e.Message})
 	}
 	out.BackupState = r.BackupState
+	if r.BackupInfo != nil {
+		bi := &agentv1.BackupInfo{}
+		for _, b := range r.BackupInfo.Backups {
+			bi.Backups = append(bi.Backups, &agentv1.BackupEntry{
+				Label: b.Label, Type: b.Type, StartUnix: b.StartUnix, StopUnix: b.StopUnix,
+				SizeBytes: b.SizeBytes, RepoBytes: b.RepoBytes,
+			})
+		}
+		out.BackupInfo = bi
+	}
 	return out
 }
 

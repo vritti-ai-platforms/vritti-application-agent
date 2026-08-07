@@ -444,6 +444,8 @@ type Command struct {
 	//	*Command_StartLogs
 	//	*Command_StopLogs
 	//	*Command_Recreate
+	//	*Command_RunBackup
+	//	*Command_RestoreDb
 	Kind          isCommand_Kind `protobuf_oneof:"kind"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -531,6 +533,24 @@ func (x *Command) GetRecreate() *Recreate {
 	return nil
 }
 
+func (x *Command) GetRunBackup() *RunBackup {
+	if x != nil {
+		if x, ok := x.Kind.(*Command_RunBackup); ok {
+			return x.RunBackup
+		}
+	}
+	return nil
+}
+
+func (x *Command) GetRestoreDb() *RestoreDB {
+	if x != nil {
+		if x, ok := x.Kind.(*Command_RestoreDb); ok {
+			return x.RestoreDb
+		}
+	}
+	return nil
+}
+
 type isCommand_Kind interface {
 	isCommand_Kind()
 }
@@ -555,6 +575,14 @@ type Command_Recreate struct {
 	Recreate *Recreate `protobuf:"bytes,5,opt,name=recreate,proto3,oneof"` // recreate one service's container so it picks up the latest env/secrets
 }
 
+type Command_RunBackup struct {
+	RunBackup *RunBackup `protobuf:"bytes,6,opt,name=run_backup,json=runBackup,proto3,oneof"` // take an on-demand pgBackRest backup now (operator pressed "Backup now")
+}
+
+type Command_RestoreDb struct {
+	RestoreDb *RestoreDB `protobuf:"bytes,7,opt,name=restore_db,json=restoreDb,proto3,oneof"` // DESTRUCTIVE: restore the managed database to a point in time or a backup set
+}
+
 func (*Command_ForceRecheck) isCommand_Kind() {}
 
 func (*Command_RequestStatus) isCommand_Kind() {}
@@ -564,6 +592,10 @@ func (*Command_StartLogs) isCommand_Kind() {}
 func (*Command_StopLogs) isCommand_Kind() {}
 
 func (*Command_Recreate) isCommand_Kind() {}
+
+func (*Command_RunBackup) isCommand_Kind() {}
+
+func (*Command_RestoreDb) isCommand_Kind() {}
 
 // ForceRecheck clears the reconcile backoff window and reconciles immediately.
 type ForceRecheck struct {
@@ -794,6 +826,110 @@ func (x *Recreate) GetService() string {
 	return ""
 }
 
+// RunBackup asks the agent to take an on-demand pgBackRest backup of the managed database now, on top of
+// the scheduled cadence (hourly incr / daily full).
+type RunBackup struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Type          string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"` // full | diff | incr
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RunBackup) Reset() {
+	*x = RunBackup{}
+	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunBackup) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunBackup) ProtoMessage() {}
+
+func (x *RunBackup) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunBackup.ProtoReflect.Descriptor instead.
+func (*RunBackup) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *RunBackup) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+// RestoreDB asks the agent to restore the managed database — DESTRUCTIVE, it overwrites the live cluster. The
+// agent takes the DB (and the app services that hold connections) offline, runs a delta pgBackRest restore, then
+// brings the stack back up recovered to the target. Exactly one target selector is used:
+//   - target_time set -> point-in-time recovery to that instant (--type=time)
+//   - set_label set   -> restore that specific backup set (--set, recover to its consistency point)
+//   - neither set      -> restore the latest backup and recover to the end of the WAL archive
+type RestoreDB struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TargetTime    string                 `protobuf:"bytes,1,opt,name=target_time,json=targetTime,proto3" json:"target_time,omitempty"` // RFC3339 instant for PITR (empty = not a time restore)
+	SetLabel      string                 `protobuf:"bytes,2,opt,name=set_label,json=setLabel,proto3" json:"set_label,omitempty"`       // pgBackRest backup label to restore (empty = not a set restore)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestoreDB) Reset() {
+	*x = RestoreDB{}
+	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreDB) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreDB) ProtoMessage() {}
+
+func (x *RestoreDB) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreDB.ProtoReflect.Descriptor instead.
+func (*RestoreDB) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *RestoreDB) GetTargetTime() string {
+	if x != nil {
+		return x.TargetTime
+	}
+	return ""
+}
+
+func (x *RestoreDB) GetSetLabel() string {
+	if x != nil {
+		return x.SetLabel
+	}
+	return ""
+}
+
 // StatusReport is the periodic heartbeat the agent pushes to cloud.
 type StatusReport struct {
 	state         protoimpl.MessageState   `protogen:"open.v1"`
@@ -806,13 +942,14 @@ type StatusReport struct {
 	Delegation    *AcmeChallengeDelegation `protobuf:"bytes,7,opt,name=delegation,proto3" json:"delegation,omitempty"`                      // one-time DNS the operator must add (present while blocked)
 	Events        []*Event                 `protobuf:"bytes,8,rep,name=events,proto3" json:"events,omitempty"`                              // notable transitions to record on the deployment timeline
 	BackupState   string                   `protobuf:"bytes,9,opt,name=backup_state,json=backupState,proto3" json:"backup_state,omitempty"` // managed-DB backups: "off" | "local" | "local+offsite"
+	BackupInfo    *BackupInfo              `protobuf:"bytes,10,opt,name=backup_info,json=backupInfo,proto3" json:"backup_info,omitempty"`   // pgBackRest backup inventory + recovery window (present when backups are on)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatusReport) Reset() {
 	*x = StatusReport{}
-	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	mi := &file_agent_v1_agent_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -824,7 +961,7 @@ func (x *StatusReport) String() string {
 func (*StatusReport) ProtoMessage() {}
 
 func (x *StatusReport) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	mi := &file_agent_v1_agent_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -837,7 +974,7 @@ func (x *StatusReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusReport.ProtoReflect.Descriptor instead.
 func (*StatusReport) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{12}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *StatusReport) GetDeploymentId() string {
@@ -903,6 +1040,144 @@ func (x *StatusReport) GetBackupState() string {
 	return ""
 }
 
+func (x *StatusReport) GetBackupInfo() *BackupInfo {
+	if x != nil {
+		return x.BackupInfo
+	}
+	return nil
+}
+
+// BackupInfo is the managed database's pgBackRest inventory, parsed from `pgbackrest info --output=json`.
+// The UI builds the full/incremental timeline + the point-in-time recovery window from the backup list.
+type BackupInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Backups       []*BackupEntry         `protobuf:"bytes,1,rep,name=backups,proto3" json:"backups,omitempty"` // ordered oldest→newest
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupInfo) Reset() {
+	*x = BackupInfo{}
+	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupInfo) ProtoMessage() {}
+
+func (x *BackupInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupInfo.ProtoReflect.Descriptor instead.
+func (*BackupInfo) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *BackupInfo) GetBackups() []*BackupEntry {
+	if x != nil {
+		return x.Backups
+	}
+	return nil
+}
+
+// BackupEntry is one pgBackRest backup set.
+type BackupEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Label         string                 `protobuf:"bytes,1,opt,name=label,proto3" json:"label,omitempty"`                           // pgBackRest backup label, e.g. 20240101-120000F
+	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`                             // full | diff | incr
+	StartUnix     int64                  `protobuf:"varint,3,opt,name=start_unix,json=startUnix,proto3" json:"start_unix,omitempty"` // backup start (unix seconds)
+	StopUnix      int64                  `protobuf:"varint,4,opt,name=stop_unix,json=stopUnix,proto3" json:"stop_unix,omitempty"`    // backup stop (unix seconds)
+	SizeBytes     uint64                 `protobuf:"varint,5,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // logical database size of the backup set
+	RepoBytes     uint64                 `protobuf:"varint,6,opt,name=repo_bytes,json=repoBytes,proto3" json:"repo_bytes,omitempty"` // compressed size stored in the repository
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupEntry) Reset() {
+	*x = BackupEntry{}
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupEntry) ProtoMessage() {}
+
+func (x *BackupEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupEntry.ProtoReflect.Descriptor instead.
+func (*BackupEntry) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *BackupEntry) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *BackupEntry) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *BackupEntry) GetStartUnix() int64 {
+	if x != nil {
+		return x.StartUnix
+	}
+	return 0
+}
+
+func (x *BackupEntry) GetStopUnix() int64 {
+	if x != nil {
+		return x.StopUnix
+	}
+	return 0
+}
+
+func (x *BackupEntry) GetSizeBytes() uint64 {
+	if x != nil {
+		return x.SizeBytes
+	}
+	return 0
+}
+
+func (x *BackupEntry) GetRepoBytes() uint64 {
+	if x != nil {
+		return x.RepoBytes
+	}
+	return 0
+}
+
 // ReportAck is the (empty) heartbeat acknowledgement.
 type ReportAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -912,7 +1187,7 @@ type ReportAck struct {
 
 func (x *ReportAck) Reset() {
 	*x = ReportAck{}
-	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -924,7 +1199,7 @@ func (x *ReportAck) String() string {
 func (*ReportAck) ProtoMessage() {}
 
 func (x *ReportAck) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -937,7 +1212,7 @@ func (x *ReportAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportAck.ProtoReflect.Descriptor instead.
 func (*ReportAck) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{13}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 // Condition is one reconcile-condition (Kubernetes-style status).
@@ -955,7 +1230,7 @@ type Condition struct {
 
 func (x *Condition) Reset() {
 	*x = Condition{}
-	mi := &file_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_agent_v1_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -967,7 +1242,7 @@ func (x *Condition) String() string {
 func (*Condition) ProtoMessage() {}
 
 func (x *Condition) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_agent_v1_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -980,7 +1255,7 @@ func (x *Condition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Condition.ProtoReflect.Descriptor instead.
 func (*Condition) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{14}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *Condition) GetType() string {
@@ -1041,7 +1316,7 @@ type ServiceStatus struct {
 
 func (x *ServiceStatus) Reset() {
 	*x = ServiceStatus{}
-	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_agent_v1_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1053,7 +1328,7 @@ func (x *ServiceStatus) String() string {
 func (*ServiceStatus) ProtoMessage() {}
 
 func (x *ServiceStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_agent_v1_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1066,7 +1341,7 @@ func (x *ServiceStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServiceStatus.ProtoReflect.Descriptor instead.
 func (*ServiceStatus) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ServiceStatus) GetComponent() string {
@@ -1135,7 +1410,7 @@ type HostMetrics struct {
 
 func (x *HostMetrics) Reset() {
 	*x = HostMetrics{}
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1147,7 +1422,7 @@ func (x *HostMetrics) String() string {
 func (*HostMetrics) ProtoMessage() {}
 
 func (x *HostMetrics) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1160,7 +1435,7 @@ func (x *HostMetrics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostMetrics.ProtoReflect.Descriptor instead.
 func (*HostMetrics) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *HostMetrics) GetCpuPercent() float64 {
@@ -1216,7 +1491,7 @@ type DiskUsageEntry struct {
 
 func (x *DiskUsageEntry) Reset() {
 	*x = DiskUsageEntry{}
-	mi := &file_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1228,7 +1503,7 @@ func (x *DiskUsageEntry) String() string {
 func (*DiskUsageEntry) ProtoMessage() {}
 
 func (x *DiskUsageEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1241,7 +1516,7 @@ func (x *DiskUsageEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiskUsageEntry.ProtoReflect.Descriptor instead.
 func (*DiskUsageEntry) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *DiskUsageEntry) GetName() string {
@@ -1270,7 +1545,7 @@ type CertReport struct {
 
 func (x *CertReport) Reset() {
 	*x = CertReport{}
-	mi := &file_agent_v1_agent_proto_msgTypes[18]
+	mi := &file_agent_v1_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1282,7 +1557,7 @@ func (x *CertReport) String() string {
 func (*CertReport) ProtoMessage() {}
 
 func (x *CertReport) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[18]
+	mi := &file_agent_v1_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1295,7 +1570,7 @@ func (x *CertReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CertReport.ProtoReflect.Descriptor instead.
 func (*CertReport) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{18}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *CertReport) GetHost() string {
@@ -1335,7 +1610,7 @@ type AcmeChallengeDelegation struct {
 
 func (x *AcmeChallengeDelegation) Reset() {
 	*x = AcmeChallengeDelegation{}
-	mi := &file_agent_v1_agent_proto_msgTypes[19]
+	mi := &file_agent_v1_agent_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1347,7 +1622,7 @@ func (x *AcmeChallengeDelegation) String() string {
 func (*AcmeChallengeDelegation) ProtoMessage() {}
 
 func (x *AcmeChallengeDelegation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[19]
+	mi := &file_agent_v1_agent_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1360,7 +1635,7 @@ func (x *AcmeChallengeDelegation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcmeChallengeDelegation.ProtoReflect.Descriptor instead.
 func (*AcmeChallengeDelegation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{19}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *AcmeChallengeDelegation) GetName() string {
@@ -1411,7 +1686,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_agent_v1_agent_proto_msgTypes[20]
+	mi := &file_agent_v1_agent_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1423,7 +1698,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[20]
+	mi := &file_agent_v1_agent_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1436,7 +1711,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{20}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *Event) GetLevel() string {
@@ -1480,7 +1755,7 @@ type LogLine struct {
 
 func (x *LogLine) Reset() {
 	*x = LogLine{}
-	mi := &file_agent_v1_agent_proto_msgTypes[21]
+	mi := &file_agent_v1_agent_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1492,7 +1767,7 @@ func (x *LogLine) String() string {
 func (*LogLine) ProtoMessage() {}
 
 func (x *LogLine) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[21]
+	mi := &file_agent_v1_agent_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1505,7 +1780,7 @@ func (x *LogLine) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogLine.ProtoReflect.Descriptor instead.
 func (*LogLine) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{21}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LogLine) GetTarget() string {
@@ -1549,7 +1824,7 @@ type LogBatch struct {
 
 func (x *LogBatch) Reset() {
 	*x = LogBatch{}
-	mi := &file_agent_v1_agent_proto_msgTypes[22]
+	mi := &file_agent_v1_agent_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1561,7 +1836,7 @@ func (x *LogBatch) String() string {
 func (*LogBatch) ProtoMessage() {}
 
 func (x *LogBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[22]
+	mi := &file_agent_v1_agent_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1574,7 +1849,7 @@ func (x *LogBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogBatch.ProtoReflect.Descriptor instead.
 func (*LogBatch) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{22}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *LogBatch) GetLines() []*LogLine {
@@ -1593,7 +1868,7 @@ type PushLogsAck struct {
 
 func (x *PushLogsAck) Reset() {
 	*x = PushLogsAck{}
-	mi := &file_agent_v1_agent_proto_msgTypes[23]
+	mi := &file_agent_v1_agent_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1605,7 +1880,7 @@ func (x *PushLogsAck) String() string {
 func (*PushLogsAck) ProtoMessage() {}
 
 func (x *PushLogsAck) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[23]
+	mi := &file_agent_v1_agent_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1618,7 +1893,7 @@ func (x *PushLogsAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushLogsAck.ProtoReflect.Descriptor instead.
 func (*PushLogsAck) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{23}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{27}
 }
 
 var File_agent_v1_agent_proto protoreflect.FileDescriptor
@@ -1651,14 +1926,18 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"keep_alive\x18\x03 \x01(\v2\x13.agent.v1.KeepAliveH\x00R\tkeepAliveB\x05\n" +
 	"\x03msg\"$\n" +
 	"\tKeepAlive\x12\x17\n" +
-	"\aunix_ts\x18\x01 \x01(\x03R\x06unixTs\"\xad\x02\n" +
+	"\aunix_ts\x18\x01 \x01(\x03R\x06unixTs\"\x99\x03\n" +
 	"\aCommand\x12=\n" +
 	"\rforce_recheck\x18\x01 \x01(\v2\x16.agent.v1.ForceRecheckH\x00R\fforceRecheck\x12@\n" +
 	"\x0erequest_status\x18\x02 \x01(\v2\x17.agent.v1.RequestStatusH\x00R\rrequestStatus\x124\n" +
 	"\n" +
 	"start_logs\x18\x03 \x01(\v2\x13.agent.v1.StartLogsH\x00R\tstartLogs\x121\n" +
 	"\tstop_logs\x18\x04 \x01(\v2\x12.agent.v1.StopLogsH\x00R\bstopLogs\x120\n" +
-	"\brecreate\x18\x05 \x01(\v2\x12.agent.v1.RecreateH\x00R\brecreateB\x06\n" +
+	"\brecreate\x18\x05 \x01(\v2\x12.agent.v1.RecreateH\x00R\brecreate\x124\n" +
+	"\n" +
+	"run_backup\x18\x06 \x01(\v2\x13.agent.v1.RunBackupH\x00R\trunBackup\x124\n" +
+	"\n" +
+	"restore_db\x18\a \x01(\v2\x13.agent.v1.RestoreDBH\x00R\trestoreDbB\x06\n" +
 	"\x04kind\"\x0e\n" +
 	"\fForceRecheck\"\x0f\n" +
 	"\rRequestStatus\"X\n" +
@@ -1670,7 +1949,13 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\bStopLogs\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\"$\n" +
 	"\bRecreate\x12\x18\n" +
-	"\aservice\x18\x01 \x01(\tR\aservice\"\xb1\x03\n" +
+	"\aservice\x18\x01 \x01(\tR\aservice\"\x1f\n" +
+	"\tRunBackup\x12\x12\n" +
+	"\x04type\x18\x01 \x01(\tR\x04type\"I\n" +
+	"\tRestoreDB\x12\x1f\n" +
+	"\vtarget_time\x18\x01 \x01(\tR\n" +
+	"targetTime\x12\x1b\n" +
+	"\tset_label\x18\x02 \x01(\tR\bsetLabel\"\xe8\x03\n" +
 	"\fStatusReport\x12#\n" +
 	"\rdeployment_id\x18\x01 \x01(\tR\fdeploymentId\x12\x1e\n" +
 	"\n" +
@@ -1686,7 +1971,23 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"delegation\x18\a \x01(\v2!.agent.v1.AcmeChallengeDelegationR\n" +
 	"delegation\x12'\n" +
 	"\x06events\x18\b \x03(\v2\x0f.agent.v1.EventR\x06events\x12!\n" +
-	"\fbackup_state\x18\t \x01(\tR\vbackupState\"\v\n" +
+	"\fbackup_state\x18\t \x01(\tR\vbackupState\x125\n" +
+	"\vbackup_info\x18\n" +
+	" \x01(\v2\x14.agent.v1.BackupInfoR\n" +
+	"backupInfo\"=\n" +
+	"\n" +
+	"BackupInfo\x12/\n" +
+	"\abackups\x18\x01 \x03(\v2\x15.agent.v1.BackupEntryR\abackups\"\xb1\x01\n" +
+	"\vBackupEntry\x12\x14\n" +
+	"\x05label\x18\x01 \x01(\tR\x05label\x12\x12\n" +
+	"\x04type\x18\x02 \x01(\tR\x04type\x12\x1d\n" +
+	"\n" +
+	"start_unix\x18\x03 \x01(\x03R\tstartUnix\x12\x1b\n" +
+	"\tstop_unix\x18\x04 \x01(\x03R\bstopUnix\x12\x1d\n" +
+	"\n" +
+	"size_bytes\x18\x05 \x01(\x04R\tsizeBytes\x12\x1d\n" +
+	"\n" +
+	"repo_bytes\x18\x06 \x01(\x04R\trepoBytes\"\v\n" +
 	"\tReportAck\"\x9d\x01\n" +
 	"\tCondition\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x16\n" +
@@ -1761,7 +2062,7 @@ func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 	return file_agent_v1_agent_proto_rawDescData
 }
 
-var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_agent_v1_agent_proto_goTypes = []any{
 	(*EnrollRequest)(nil),           // 0: agent.v1.EnrollRequest
 	(*EnrollResponse)(nil),          // 1: agent.v1.EnrollResponse
@@ -1775,18 +2076,22 @@ var file_agent_v1_agent_proto_goTypes = []any{
 	(*StartLogs)(nil),               // 9: agent.v1.StartLogs
 	(*StopLogs)(nil),                // 10: agent.v1.StopLogs
 	(*Recreate)(nil),                // 11: agent.v1.Recreate
-	(*StatusReport)(nil),            // 12: agent.v1.StatusReport
-	(*ReportAck)(nil),               // 13: agent.v1.ReportAck
-	(*Condition)(nil),               // 14: agent.v1.Condition
-	(*ServiceStatus)(nil),           // 15: agent.v1.ServiceStatus
-	(*HostMetrics)(nil),             // 16: agent.v1.HostMetrics
-	(*DiskUsageEntry)(nil),          // 17: agent.v1.DiskUsageEntry
-	(*CertReport)(nil),              // 18: agent.v1.CertReport
-	(*AcmeChallengeDelegation)(nil), // 19: agent.v1.AcmeChallengeDelegation
-	(*Event)(nil),                   // 20: agent.v1.Event
-	(*LogLine)(nil),                 // 21: agent.v1.LogLine
-	(*LogBatch)(nil),                // 22: agent.v1.LogBatch
-	(*PushLogsAck)(nil),             // 23: agent.v1.PushLogsAck
+	(*RunBackup)(nil),               // 12: agent.v1.RunBackup
+	(*RestoreDB)(nil),               // 13: agent.v1.RestoreDB
+	(*StatusReport)(nil),            // 14: agent.v1.StatusReport
+	(*BackupInfo)(nil),              // 15: agent.v1.BackupInfo
+	(*BackupEntry)(nil),             // 16: agent.v1.BackupEntry
+	(*ReportAck)(nil),               // 17: agent.v1.ReportAck
+	(*Condition)(nil),               // 18: agent.v1.Condition
+	(*ServiceStatus)(nil),           // 19: agent.v1.ServiceStatus
+	(*HostMetrics)(nil),             // 20: agent.v1.HostMetrics
+	(*DiskUsageEntry)(nil),          // 21: agent.v1.DiskUsageEntry
+	(*CertReport)(nil),              // 22: agent.v1.CertReport
+	(*AcmeChallengeDelegation)(nil), // 23: agent.v1.AcmeChallengeDelegation
+	(*Event)(nil),                   // 24: agent.v1.Event
+	(*LogLine)(nil),                 // 25: agent.v1.LogLine
+	(*LogBatch)(nil),                // 26: agent.v1.LogBatch
+	(*PushLogsAck)(nil),             // 27: agent.v1.PushLogsAck
 }
 var file_agent_v1_agent_proto_depIdxs = []int32{
 	3,  // 0: agent.v1.ServerMessage.desired_state:type_name -> agent.v1.SignedDesiredState
@@ -1797,27 +2102,31 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	9,  // 5: agent.v1.Command.start_logs:type_name -> agent.v1.StartLogs
 	10, // 6: agent.v1.Command.stop_logs:type_name -> agent.v1.StopLogs
 	11, // 7: agent.v1.Command.recreate:type_name -> agent.v1.Recreate
-	14, // 8: agent.v1.StatusReport.conditions:type_name -> agent.v1.Condition
-	15, // 9: agent.v1.StatusReport.services:type_name -> agent.v1.ServiceStatus
-	16, // 10: agent.v1.StatusReport.host:type_name -> agent.v1.HostMetrics
-	18, // 11: agent.v1.StatusReport.certificates:type_name -> agent.v1.CertReport
-	19, // 12: agent.v1.StatusReport.delegation:type_name -> agent.v1.AcmeChallengeDelegation
-	20, // 13: agent.v1.StatusReport.events:type_name -> agent.v1.Event
-	17, // 14: agent.v1.HostMetrics.disk_breakdown:type_name -> agent.v1.DiskUsageEntry
-	21, // 15: agent.v1.LogBatch.lines:type_name -> agent.v1.LogLine
-	0,  // 16: agent.v1.AgentService.Enroll:input_type -> agent.v1.EnrollRequest
-	2,  // 17: agent.v1.AgentService.Subscribe:input_type -> agent.v1.SubscribeRequest
-	12, // 18: agent.v1.AgentService.ReportStatus:input_type -> agent.v1.StatusReport
-	22, // 19: agent.v1.AgentService.PushLogs:input_type -> agent.v1.LogBatch
-	1,  // 20: agent.v1.AgentService.Enroll:output_type -> agent.v1.EnrollResponse
-	4,  // 21: agent.v1.AgentService.Subscribe:output_type -> agent.v1.ServerMessage
-	13, // 22: agent.v1.AgentService.ReportStatus:output_type -> agent.v1.ReportAck
-	23, // 23: agent.v1.AgentService.PushLogs:output_type -> agent.v1.PushLogsAck
-	20, // [20:24] is the sub-list for method output_type
-	16, // [16:20] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	12, // 8: agent.v1.Command.run_backup:type_name -> agent.v1.RunBackup
+	13, // 9: agent.v1.Command.restore_db:type_name -> agent.v1.RestoreDB
+	18, // 10: agent.v1.StatusReport.conditions:type_name -> agent.v1.Condition
+	19, // 11: agent.v1.StatusReport.services:type_name -> agent.v1.ServiceStatus
+	20, // 12: agent.v1.StatusReport.host:type_name -> agent.v1.HostMetrics
+	22, // 13: agent.v1.StatusReport.certificates:type_name -> agent.v1.CertReport
+	23, // 14: agent.v1.StatusReport.delegation:type_name -> agent.v1.AcmeChallengeDelegation
+	24, // 15: agent.v1.StatusReport.events:type_name -> agent.v1.Event
+	15, // 16: agent.v1.StatusReport.backup_info:type_name -> agent.v1.BackupInfo
+	16, // 17: agent.v1.BackupInfo.backups:type_name -> agent.v1.BackupEntry
+	21, // 18: agent.v1.HostMetrics.disk_breakdown:type_name -> agent.v1.DiskUsageEntry
+	25, // 19: agent.v1.LogBatch.lines:type_name -> agent.v1.LogLine
+	0,  // 20: agent.v1.AgentService.Enroll:input_type -> agent.v1.EnrollRequest
+	2,  // 21: agent.v1.AgentService.Subscribe:input_type -> agent.v1.SubscribeRequest
+	14, // 22: agent.v1.AgentService.ReportStatus:input_type -> agent.v1.StatusReport
+	26, // 23: agent.v1.AgentService.PushLogs:input_type -> agent.v1.LogBatch
+	1,  // 24: agent.v1.AgentService.Enroll:output_type -> agent.v1.EnrollResponse
+	4,  // 25: agent.v1.AgentService.Subscribe:output_type -> agent.v1.ServerMessage
+	17, // 26: agent.v1.AgentService.ReportStatus:output_type -> agent.v1.ReportAck
+	27, // 27: agent.v1.AgentService.PushLogs:output_type -> agent.v1.PushLogsAck
+	24, // [24:28] is the sub-list for method output_type
+	20, // [20:24] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_agent_proto_init() }
@@ -1836,6 +2145,8 @@ func file_agent_v1_agent_proto_init() {
 		(*Command_StartLogs)(nil),
 		(*Command_StopLogs)(nil),
 		(*Command_Recreate)(nil),
+		(*Command_RunBackup)(nil),
+		(*Command_RestoreDb)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1843,7 +2154,7 @@ func file_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   24,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -99,6 +99,8 @@ message Command {
     StartLogs start_logs = 3;         // begin tailing a container's logs (a browser opened a log view)
     StopLogs stop_logs = 4;           // stop tailing (the last viewer left)
     Recreate recreate = 5;            // recreate one service's container so it picks up the latest env/secrets
+    RunBackup run_backup = 6;         // take an on-demand pgBackRest backup now (operator pressed "Backup now")
+    RestoreDB restore_db = 7;         // DESTRUCTIVE: restore the managed database to a point in time or a backup set
   }
 }
 
@@ -129,6 +131,23 @@ message Recreate {
   string service = 1;
 }
 
+// RunBackup asks the agent to take an on-demand pgBackRest backup of the managed database now, on top of
+// the scheduled cadence (hourly incr / daily full).
+message RunBackup {
+  string type = 1; // full | diff | incr
+}
+
+// RestoreDB asks the agent to restore the managed database — DESTRUCTIVE, it overwrites the live cluster. The
+// agent takes the DB (and the app services that hold connections) offline, runs a delta pgBackRest restore, then
+// brings the stack back up recovered to the target. Exactly one target selector is used:
+//   - target_time set -> point-in-time recovery to that instant (--type=time)
+//   - set_label set   -> restore that specific backup set (--set, recover to its consistency point)
+//   - neither set      -> restore the latest backup and recover to the end of the WAL archive
+message RestoreDB {
+  string target_time = 1; // RFC3339 instant for PITR (empty = not a time restore)
+  string set_label = 2;   // pgBackRest backup label to restore (empty = not a set restore)
+}
+
 // ---------------------------------------------------------------------------
 // Status heartbeat (agent -> cloud)
 // ---------------------------------------------------------------------------
@@ -144,6 +163,23 @@ message StatusReport {
   AcmeChallengeDelegation delegation = 7;  // one-time DNS the operator must add (present while blocked)
   repeated Event events = 8;               // notable transitions to record on the deployment timeline
   string backup_state = 9;                  // managed-DB backups: "off" | "local" | "local+offsite"
+  BackupInfo backup_info = 10;              // pgBackRest backup inventory + recovery window (present when backups are on)
+}
+
+// BackupInfo is the managed database's pgBackRest inventory, parsed from `pgbackrest info --output=json`.
+// The UI builds the full/incremental timeline + the point-in-time recovery window from the backup list.
+message BackupInfo {
+  repeated BackupEntry backups = 1; // ordered oldest→newest
+}
+
+// BackupEntry is one pgBackRest backup set.
+message BackupEntry {
+  string label = 1;      // pgBackRest backup label, e.g. 20240101-120000F
+  string type = 2;       // full | diff | incr
+  int64 start_unix = 3;  // backup start (unix seconds)
+  int64 stop_unix = 4;   // backup stop (unix seconds)
+  uint64 size_bytes = 5; // logical database size of the backup set
+  uint64 repo_bytes = 6; // compressed size stored in the repository
 }
 
 // ReportAck is the (empty) heartbeat acknowledgement.

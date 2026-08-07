@@ -153,6 +153,7 @@ type DesiredState struct {
 	WebBundles    []WebBundle       `json:"webBundles"`    // static web artifacts the managed edge serves off *.<base>
 	Config        map[string]string `json:"config"`        // plaintext non-secret config (R2 bucket names, tunables)
 	SealedSecrets map[string]string `json:"sealedSecrets"` // name -> base64 sealed ciphertext (agent decrypts)
+	Stopped       bool              `json:"stopped"`       // operator took the whole deployment offline: tear the stack down and suspend self-heal until cleared
 }
 
 // SignedDesiredState wraps the canonical desired-state JSON with cloud's signature over exactly
@@ -252,4 +253,22 @@ type StatusReport struct {
 	// BackupState is the managed-DB backup topology: "" (backups off), "local" (repo1 only), or
 	// "local+offsite" (repo1 + encrypted repo2 on S3). Cloud surfaces it in the admin UI.
 	BackupState string `json:"backupState,omitempty"`
+	// BackupInfo is the pgBackRest inventory (backup sets + their sizes/timestamps), present when backups
+	// are on. The UI builds the full/incremental timeline + recovery window from it.
+	BackupInfo *BackupInfo `json:"backupInfo,omitempty"`
+}
+
+// BackupInfo is the managed database's pgBackRest inventory, parsed from `pgbackrest info --output=json`.
+type BackupInfo struct {
+	Backups []BackupEntry `json:"backups"` // ordered oldest→newest
+}
+
+// BackupEntry is one pgBackRest backup set.
+type BackupEntry struct {
+	Label     string `json:"label"`     // pgBackRest label, e.g. 20240101-120000F
+	Type      string `json:"type"`      // full | diff | incr
+	StartUnix int64  `json:"startUnix"` // backup start (unix seconds)
+	StopUnix  int64  `json:"stopUnix"`  // backup stop (unix seconds)
+	SizeBytes uint64 `json:"sizeBytes"` // logical database size of the backup set
+	RepoBytes uint64 `json:"repoBytes"` // compressed bytes this backup added to the repository
 }
