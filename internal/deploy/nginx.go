@@ -126,7 +126,7 @@ func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.Desired
 	if err := WriteAcmeDnsConfig(stackRoot, ds.BaseDomain, publicIP); err != nil {
 		return WildcardResult{Outcome: WildcardOutcomeError}, err
 	}
-	if err := Apply(ctx, dx, AcmeDnsSpec(stackRoot)); err != nil {
+	if err := Apply(ctx, dx, AcmeDnsSpec(stackRoot), nil); err != nil {
 		return WildcardResult{Outcome: WildcardOutcomeError}, fmt.Errorf("acme-dns: %w", err)
 	}
 	// lego registers/updates records over acme-dns' HTTP API — wait for it to accept connections
@@ -204,7 +204,7 @@ func EnsureWildcard(ctx context.Context, dx *dockerx.Client, ds cloudapi.Desired
 // EnsureNginx renders the edge config off the issued wildcard (routing derived from the base domain),
 // syncs the static web bundles, and (re)starts nginx. Run AFTER the stack is provisioned so upstreams
 // resolve and AFTER the wildcard exists (gated by the caller), so nginx comes up serving HTTPS.
-func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string) ([]cloudapi.CertReport, error) {
+func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredState, stackRoot string, coreEnv []string, forceRecreate map[string]bool) ([]cloudapi.CertReport, error) {
 	giteaEnabled := ds.Components.Gitea != nil && ds.Components.Gitea.Enabled
 	corePort := envPort(coreEnv, DefaultCorePort)
 	routes := DerivedRoutes(ds.BaseDomain, corePort, giteaEnabled)
@@ -225,7 +225,7 @@ func EnsureNginx(ctx context.Context, dx *dockerx.Client, ds cloudapi.DesiredSta
 	if err != nil {
 		return nil, err
 	}
-	if err := Apply(ctx, dx, NginxSpec(ds, stackRoot)); err != nil {
+	if err := Apply(ctx, dx, NginxSpec(ds, stackRoot), forceRecreate); err != nil {
 		return nil, fmt.Errorf("nginx: %w", err)
 	}
 	if changed {

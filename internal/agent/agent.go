@@ -74,6 +74,7 @@ type Agent struct {
 	lastGeneration int64
 	lastDesired    *cloudapi.DesiredState // last verified desired-state — re-applied on force-recheck / blocked self-heal
 	archiving      bool                   // pgBackRest add-on currently enabled (drives the backup ticker)
+	backupMode     string                 // "off" | "local" | "local+offsite" — reported to cloud for the UI
 	hadFullBackup  bool                   // a full backup has been taken since archiving was enabled
 	edgeManaged    bool                   // agent runs nginx + the bundled acme-dns wildcard edge
 	certs          []cloudapi.CertReport  // last observed managed-edge certs (reported each heartbeat)
@@ -103,6 +104,11 @@ type Agent struct {
 	// stream) that clears the backoff window and re-applies the last desired-state immediately.
 	forceRecheckCh chan struct{}
 
+	// recreateCh carries per-service Recreate commands (service name); the Run loop marks the service in
+	// forceRecreate and re-applies so it is rebuilt with freshly-fetched env. forceRecreate is drained each run.
+	recreateCh    chan string
+	forceRecreate map[string]bool
+
 	// pendingEvents buffers notable transitions until the next heartbeat drains them.
 	pendingEvents []cloudapi.Event
 }
@@ -126,6 +132,8 @@ func New(ctx context.Context, log *slog.Logger) (*Agent, error) {
 	return &Agent{
 		cfg: cfg, log: log, keys: keys, dx: dx, cloud: cloud,
 		forceRecheckCh: make(chan struct{}, 1),
+		recreateCh:     make(chan string, 8),
+		backupMode:     deploy.BackupModeOff, // until the first reconcile determines the real mode
 	}, nil
 }
 
@@ -135,6 +143,18 @@ func (a *Agent) forceRecheck() {
 	select {
 	case a.forceRecheckCh <- struct{}{}:
 	default: // a recheck is already queued
+	}
+}
+
+// requestRecreate queues a per-service Recreate (driven by the cloud Recreate command); the Run loop marks
+// the service for a forced recreate on the next reconcile so it picks up freshly-fetched env.
+func (a *Agent) requestRecreate(service string) {
+	if service == "" {
+		return
+	}
+	select {
+	case a.recreateCh <- service:
+	default: // queue full — a burst of recreates; the queued ones already cover the same intent
 	}
 }
 
@@ -222,6 +242,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			case <-a.forceRecheckCh:
 				a.nextAttempt = time.Time{} // clear any backoff window so the retry runs now
 				a.reapply(ctx)
+			case svc := <-a.recreateCh:
+				if a.forceRecreate == nil {
+					a.forceRecreate = map[string]bool{}
+				}
+				a.forceRecreate[svc] = true
+				a.nextAttempt = time.Time{} // clear backoff so the recreate runs now
+				a.reapply(ctx)
 			case <-backupTicker.C:
 				a.runScheduledBackup(ctx, &backupTick)
 			}
@@ -295,6 +322,10 @@ func (a *Agent) handleServerEvent(ctx context.Context, ev *cloudapi.ServerEvent)
 		}
 		if ev.Command.StopLogs != nil {
 			a.logs.stop(ev.Command.StopLogs.Target)
+		}
+		if ev.Command.Recreate != nil {
+			a.log.Info("recreate command received", "service", ev.Command.Recreate.Service)
+			a.requestRecreate(ev.Command.Recreate.Service)
 		}
 	case ev.KeepAlive:
 		// liveness frame only — nothing to do
@@ -553,12 +584,32 @@ func (a *Agent) verifyDesiredState(signed *cloudapi.SignedDesiredState) (cloudap
 
 // reconcile drives the stack toward one already-verified desired-state.
 func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
+	// Consume any queued per-service Recreate requests: the named services are force-rebuilt below (with
+	// freshly-fetched env) even if their spec is byte-identical. Drained once so a later reconcile is normal.
+	force := a.forceRecreate
+	a.forceRecreate = nil
+
 	// (1) Resolve the stack composition from components (nil = component absent). The DB defaults to
 	// managed unless explicitly external; the edge/gitea are off unless their component says otherwise.
 	dbExternal := ds.Components.Database != nil && ds.Components.Database.Mode == cloudapi.ModeExternal
 	dbManaged := !dbExternal
 	pgBackRest := dbManaged && ds.Components.Database != nil && ds.Components.Database.Backup != nil
 	giteaEnabled := ds.Components.Gitea != nil && ds.Components.Gitea.Enabled
+
+	// (1a) Managed→external transition: if the managed DB had backups on, take a FINAL full backup while its
+	// container is still up (the prune at the end removes it). Mark it handled immediately so a mid-reconcile
+	// retry can't repeat it. Backups persist on disk (repo1) + offsite (repo2); a failure here won't block the
+	// switch. When backups were off, we just let the container be removed below.
+	if dbExternal && a.archiving {
+		a.archiving = false
+		a.step(ds.Generation, "database", "FinalBackup", "Taking a final full backup before removing the managed database.")
+		if err := deploy.RunBackup(ctx, a.dx, "full"); err != nil {
+			a.log.Warn("final backup before managed→external teardown failed", "err", err)
+			a.emit("warn", "database", "FinalBackupFailed", fmt.Sprintf("Final backup before removing the managed database failed: %v", err))
+		} else {
+			a.emit("info", "database", "FinalBackupComplete", "Final full backup complete before removing the managed database.")
+		}
+	}
 
 	// (2) Decrypt the sealed secrets once. Names prefixed `secretStore.` carry the SECRET half of
 	// the secret-store auth method (client secret, token, jwt, ...) — strip the prefix into
@@ -748,6 +799,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// (7) Managed mode: bring up Postgres (archive-aware), wait healthy, provision roles/schemas,
 	// and — when the pgBackRest add-on is on — write its config, init the stanza, take a base backup.
 	archiving := pgBackRest
+	a.backupMode = deploy.BackupModeOff // reset; set to the configured topology below once backups are validated
 	if dbManaged {
 		a.step(ds.Generation, "database", "ProvisioningDatabase", "Provisioning the managed Postgres database.")
 		if archiving {
@@ -766,6 +818,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 			if err := deploy.ValidateBackupSecrets(backupEnv); err != nil {
 				return err
 			}
+			a.backupMode = deploy.BackupMode(backupEnv) // "local" or "local+offsite" — reported to cloud
 			confDir := deploy.PgBackRestConfDir(a.cfg.StackRoot)
 			confPath := filepath.Join(confDir, "pgbackrest.conf")
 			conf := deploy.RenderPgBackRestConf(ds, backupEnv, db.OwnerUser)
@@ -782,7 +835,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 			}
 		}
 		pg := deploy.PostgresSpec(ds, db, a.cfg.StackRoot, archiving)
-		if err := deploy.Apply(ctx, a.dx, pg); err != nil {
+		if err := deploy.Apply(ctx, a.dx, pg, force); err != nil {
 			return fmt.Errorf("postgres: %w", err)
 		}
 		keep[pg.Name] = true
@@ -837,7 +890,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 			return fmt.Errorf("chown gitea data dir: %w", err)
 		}
 		giteaSpec := deploy.GiteaSpec(ds, db, a.cfg.StackRoot)
-		if err := deploy.Apply(ctx, a.dx, giteaSpec); err != nil {
+		if err := deploy.Apply(ctx, a.dx, giteaSpec, force); err != nil {
 			return fmt.Errorf("gitea: %w", err)
 		}
 		keep[giteaSpec.Name] = true
@@ -865,7 +918,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 
 	a.step(ds.Generation, "core", "StartingServices", "Starting the core services (redis, nats, commerce, core-server).")
 	for _, spec := range longRunning {
-		if err := deploy.Apply(ctx, a.dx, spec); err != nil {
+		if err := deploy.Apply(ctx, a.dx, spec, force); err != nil {
 			return fmt.Errorf("%s: %w", spec.Name, err)
 		}
 		keep[spec.Name] = true
@@ -875,7 +928,7 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 	// derived routes (api./git./*.) + sync the web bundles and (re)start nginx — it comes up serving
 	// HTTPS immediately. edge=external means a BYO ingress/LB fronts core: no nginx, no acme-dns.
 	if a.edgeManaged {
-		certs, err := deploy.EnsureNginx(ctx, a.dx, ds, a.cfg.StackRoot, coreEnvSlice)
+		certs, err := deploy.EnsureNginx(ctx, a.dx, ds, a.cfg.StackRoot, coreEnvSlice, force)
 		if err != nil {
 			return err
 		}
@@ -941,6 +994,7 @@ func (a *Agent) report(ctx context.Context, generation int64, conditions []cloud
 		Certificates: a.certs,
 		Delegation:   a.acmeDelegation,
 		Events:       events,
+		BackupMode:   a.backupMode,
 		Host: &cloudapi.HostMetrics{
 			CPUPercent:     hm.CPUPercent,
 			MemTotalBytes:  hm.MemTotalBytes,

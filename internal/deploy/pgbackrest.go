@@ -15,34 +15,35 @@ const StanzaName = "core"
 // Backup secret keys sourced from the `/backup` secret-store folder. Both cipher passphrases live in the
 // secret store (NOT on the VM): a VM-local key would make the OFFSITE repo2 backups unrecoverable after a
 // VM/agent loss — the exact scenario backups exist for. repo1 (local) is always on; repo2 (offsite S3) is
-// opt-in but all-or-nothing so a partial config fails loudly instead of silently dropping the offsite copy.
+// gated on its cipher passphrase — setting PGBACKREST_REPO2_CIPHER_PASS is the switch that says "offsite is
+// intended", which then requires the full S3 credential set so a partial config fails loudly.
 const (
 	BackupRepo1CipherPass = "PGBACKREST_REPO1_CIPHER_PASS"
 	BackupRepo2CipherPass = "PGBACKREST_REPO2_CIPHER_PASS"
 )
 
-var backupOffsiteKeys = []string{
-	"S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", BackupRepo2CipherPass,
-}
+// backupS3Keys are the offsite (repo2) object-store credentials, required once the repo2 cipher passphrase
+// is set.
+var backupS3Keys = []string{"S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"}
+
+// Backup mode strings reported to cloud so the admin UI can show whether offsite is configured.
+const (
+	BackupModeOff     = "off"           // backups add-on disabled
+	BackupModeLocal   = "local"         // repo1 only (encrypted, on the VM disk)
+	BackupModeOffsite = "local+offsite" // repo1 + encrypted repo2 on an S3-compatible store
+)
 
 // ValidateBackupSecrets checks the `/backup` folder has everything pgBackRest needs BEFORE the stanza is
 // created, so a missing key surfaces as a clear reconcile error instead of standing up an unencrypted or
-// half-configured repo. repo1's cipher is always required; the offsite (repo2) set is required only once the
-// operator has started configuring it (any offsite key present) — then all of it must be present.
+// half-configured repo. repo1's cipher is always required; offsite (repo2) is gated on its cipher passphrase
+// — once PGBACKREST_REPO2_CIPHER_PASS is set, all four S3 credentials must also be present.
 func ValidateBackupSecrets(env map[string]string) error {
 	var missing []string
 	if strings.TrimSpace(env[BackupRepo1CipherPass]) == "" {
 		missing = append(missing, BackupRepo1CipherPass)
 	}
-	anyOffsite := false
-	for _, k := range backupOffsiteKeys {
-		if strings.TrimSpace(env[k]) != "" {
-			anyOffsite = true
-			break
-		}
-	}
-	if anyOffsite {
-		for _, k := range backupOffsiteKeys {
+	if strings.TrimSpace(env[BackupRepo2CipherPass]) != "" {
+		for _, k := range backupS3Keys {
 			if strings.TrimSpace(env[k]) == "" {
 				missing = append(missing, k)
 			}
@@ -52,6 +53,16 @@ func ValidateBackupSecrets(env map[string]string) error {
 		return fmt.Errorf("missing required /backup secrets: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// BackupMode reports the configured backup topology so cloud/UI can show it. Assumes ValidateBackupSecrets
+// passed: repo1 is always present, and offsite repo2 is on exactly when its cipher passphrase (+ S3 creds)
+// is set. Returns BackupModeLocal or BackupModeOffsite.
+func BackupMode(env map[string]string) string {
+	if strings.TrimSpace(env[BackupRepo2CipherPass]) != "" {
+		return BackupModeOffsite
+	}
+	return BackupModeLocal
 }
 
 // pgbackrest commands run as the postgres OS user inside the Postgres container (it owns PGDATA
@@ -79,11 +90,13 @@ func RenderPgBackRestConf(ds cloudapi.DesiredState, backup map[string]string, pg
 	b.WriteString("repo1-cipher-type=aes-256-cbc\n")
 	fmt.Fprintf(&b, "repo1-cipher-pass=%s\n", backup[BackupRepo1CipherPass])
 
-	// repo2 = any S3-compatible object store (Cloudflare R2, AWS S3, MinIO, …), only when the operator
-	// supplied the S3 secrets. Region defaults to "auto" (R2/MinIO); AWS needs a real region via S3_REGION.
+	// repo2 = any S3-compatible object store (Cloudflare R2, AWS S3, MinIO, …), gated on the repo2 cipher
+	// passphrase (the offsite switch) plus the full S3 credential set — matching ValidateBackupSecrets so we
+	// never write a half-configured or unencrypted repo2. Region defaults to "auto" (R2/MinIO); AWS needs a
+	// real region via S3_REGION.
 	endpoint, bucket := backup["S3_ENDPOINT"], backup["S3_BUCKET"]
 	key, secret := backup["S3_ACCESS_KEY_ID"], backup["S3_SECRET_ACCESS_KEY"]
-	if endpoint != "" && bucket != "" && key != "" && secret != "" {
+	if backup[BackupRepo2CipherPass] != "" && endpoint != "" && bucket != "" && key != "" && secret != "" {
 		region := backup["S3_REGION"]
 		if region == "" {
 			region = "auto"

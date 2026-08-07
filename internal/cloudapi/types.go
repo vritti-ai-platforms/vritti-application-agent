@@ -249,4 +249,7 @@ type StatusReport struct {
 	Delegation *AcmeChallengeDelegation `json:"delegation,omitempty"`
 	// Events are notable transitions the agent asks cloud to record on the deployment timeline.
 	Events []Event `json:"events,omitempty"`
+	// BackupMode is the managed-DB backup topology: "" (backups off), "local" (repo1 only), or
+	// "local+offsite" (repo1 + encrypted repo2 on S3). Cloud surfaces it in the admin UI.
+	BackupMode string `json:"backupMode,omitempty"`
 }

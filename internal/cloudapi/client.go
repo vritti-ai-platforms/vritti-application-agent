@@ -133,6 +133,12 @@ type Command struct {
 	RequestStatus bool
 	StartLogs     *StartLogs
 	StopLogs      *StopLogs
+	Recreate      *Recreate
+}
+
+// Recreate asks the agent to recreate one service's container so it picks up the latest env/secrets.
+type Recreate struct {
+	Service string
 }
 
 // StartLogs asks the agent to tail one container ("agent" or a service name) and stream its lines up.
@@ -183,6 +189,8 @@ func mapCommand(c *agentv1.Command) *Command {
 		return &Command{StartLogs: &StartLogs{Target: k.StartLogs.Target, TailLines: k.StartLogs.TailLines, Since: k.StartLogs.Since}}
 	case *agentv1.Command_StopLogs:
 		return &Command{StopLogs: &StopLogs{Target: k.StopLogs.Target}}
+	case *agentv1.Command_Recreate:
+		return &Command{Recreate: &Recreate{Service: k.Recreate.Service}}
 	default:
 		return &Command{}
 	}
@@ -223,6 +231,7 @@ func toProtoStatusReport(r StatusReport) *agentv1.StatusReport {
 	for _, e := range r.Events {
 		out.Events = append(out.Events, &agentv1.Event{Level: e.Level, Component: e.Component, Reason: e.Reason, Message: e.Message})
 	}
+	out.BackupMode = r.BackupMode
 	return out
 }
 

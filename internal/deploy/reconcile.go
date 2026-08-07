@@ -18,25 +18,29 @@ func SpecHash(spec dockerx.RunSpec) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Apply reconciles a single long-running service: pull its image, and (re)create the container
-// only when the desired spec differs from what is already running.
-func Apply(ctx context.Context, dx *dockerx.Client, spec dockerx.RunSpec) error {
+// Apply reconciles a single long-running service: pull its image, and (re)create the container only when
+// the desired spec differs from what is already running — unless forceRecreate names this spec, in which case
+// it is always re-run so it picks up freshly-fetched env even when the spec is byte-identical (the operator's
+// per-service Recreate action).
+func Apply(ctx context.Context, dx *dockerx.Client, spec dockerx.RunSpec, forceRecreate map[string]bool) error {
 	if err := dx.PullImage(ctx, spec.Image); err != nil {
 		return err
 	}
 	want := SpecHash(spec)
-	have, err := dx.SpecHash(ctx, spec.Name)
-	if err != nil {
-		return err
-	}
-	if have == want {
-		// Spec unchanged — but "converged" must also mean actually running. A crash that exhausted its
-		// restart retries, or a manual `docker stop` (RestartPolicyUnlessStopped won't undo that), leaves a
-		// matching-hash container stopped; a hash-only check would strand it down until the spec changes.
-		if _, err := dx.EnsureStarted(ctx, spec.Name); err != nil {
+	if !forceRecreate[spec.Name] {
+		have, err := dx.SpecHash(ctx, spec.Name)
+		if err != nil {
 			return err
 		}
-		return nil
+		if have == want {
+			// Spec unchanged — but "converged" must also mean actually running. A crash that exhausted its
+			// restart retries, or a manual `docker stop` (RestartPolicyUnlessStopped won't undo that), leaves a
+			// matching-hash container stopped; a hash-only check would strand it down until the spec changes.
+			if _, err := dx.EnsureStarted(ctx, spec.Name); err != nil {
+				return err
+			}
+			return nil
+		}
 	}
 	if spec.Labels == nil {
 		spec.Labels = map[string]string{}

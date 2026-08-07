@@ -98,6 +98,7 @@ message Command {
     RequestStatus request_status = 2; // report current status immediately (no reconcile) — on-demand cockpit paint
     StartLogs start_logs = 3;         // begin tailing a container's logs (a browser opened a log view)
     StopLogs stop_logs = 4;           // stop tailing (the last viewer left)
+    Recreate recreate = 5;            // recreate one service's container so it picks up the latest env/secrets
   }
 }
 
@@ -121,6 +122,13 @@ message StopLogs {
   string target = 1;
 }
 
+// Recreate asks the agent to recreate one service's container so it picks up the latest env/secrets
+// (env is baked in at container creation). service is the logical key: core-server, redis, commerce-service,
+// gitea, postgres, nats, nginx, ...
+message Recreate {
+  string service = 1;
+}
+
 // ---------------------------------------------------------------------------
 // Status heartbeat (agent -> cloud)
 // ---------------------------------------------------------------------------
@@ -135,6 +143,7 @@ message StatusReport {
   repeated CertReport certificates = 6;    // managed-edge cert expiries (cloud is system of record)
   AcmeChallengeDelegation delegation = 7;  // one-time DNS the operator must add (present while blocked)
   repeated Event events = 8;               // notable transitions to record on the deployment timeline
+  string backup_mode = 9;                  // managed-DB backups: "off" | "local" | "local+offsite"
 }
 
 // ReportAck is the (empty) heartbeat acknowledgement.
