@@ -197,6 +197,10 @@ func GiteaStorageEnv(giteaEnv map[string]string) []string {
 	if bucket == "" || endpoint == "" || accessKey == "" || secretKey == "" {
 		return nil
 	}
+	// minio-go wants a bare host[:port] and rejects a fully-qualified URL ("Endpoint url cannot have fully
+	// qualified paths"). Strip any scheme + path an operator pasted in; TLS is driven by MINIO_USE_SSL below.
+	endpoint = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(endpoint), "https://"), "http://")
+	endpoint, _, _ = strings.Cut(endpoint, "/")
 	return []string{
 		"GITEA__storage__STORAGE_TYPE=minio",
 		giteaStorageEndpoint + "=" + endpoint,
