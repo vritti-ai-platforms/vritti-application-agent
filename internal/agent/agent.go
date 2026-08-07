@@ -889,7 +889,11 @@ func (a *Agent) reconcile(ctx context.Context, ds cloudapi.DesiredState) error {
 		if err := os.Chown(deploy.GiteaDataDir(a.cfg.StackRoot), deploy.GiteaUID, deploy.GiteaUID); err != nil {
 			return fmt.Errorf("chown gitea data dir: %w", err)
 		}
-		giteaSpec := deploy.GiteaSpec(ds, db, a.cfg.StackRoot)
+		giteaStorage := deploy.GiteaStorageEnv(giteaEnv)
+		if len(giteaStorage) > 0 {
+			a.log.Info("gitea object storage offloaded to S3/R2", "bucket", giteaEnv["GITEA__storage__MINIO_BUCKET"])
+		}
+		giteaSpec := deploy.GiteaSpec(ds, db, a.cfg.StackRoot, giteaStorage)
 		if err := deploy.Apply(ctx, a.dx, giteaSpec, force); err != nil {
 			return fmt.Errorf("gitea: %w", err)
 		}

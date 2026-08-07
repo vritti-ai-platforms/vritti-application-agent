@@ -178,7 +178,39 @@ func MigrateSpec(name, image string, env []string) dockerx.RunSpec {
 }
 
 // GiteaSpec runs the Gitea server backed by the shared vritti_core DB in its own `gitea` schema.
-func GiteaSpec(ds cloudapi.DesiredState, db DBConn, stackRoot string) dockerx.RunSpec {
+// Gitea R2/S3 storage keys the operator places (as their full GITEA__storage__* names) in /agent/gitea.
+const (
+	giteaStorageBucket    = "GITEA__storage__MINIO_BUCKET"
+	giteaStorageEndpoint  = "GITEA__storage__MINIO_ENDPOINT"
+	giteaStorageAccessKey = "GITEA__storage__MINIO_ACCESS_KEY_ID"
+	giteaStorageSecretKey = "GITEA__storage__MINIO_SECRET_ACCESS_KEY"
+)
+
+// GiteaStorageEnv offloads Gitea's object storage — LFS, attachments, packages, avatars, Actions artifacts,
+// but NOT git repositories (those always stay on disk) — to an S3-compatible store when the four MINIO creds
+// are present in /agent/gitea. It forwards those four verbatim and adds the fixed R2 knobs (minio type, auto
+// region, SSL, path-style, and md5 checksum since R2 rejects minio-go's default trailing checksum). Returns
+// nil when the creds are absent, leaving Gitea on its default on-disk storage.
+func GiteaStorageEnv(giteaEnv map[string]string) []string {
+	bucket, endpoint := giteaEnv[giteaStorageBucket], giteaEnv[giteaStorageEndpoint]
+	accessKey, secretKey := giteaEnv[giteaStorageAccessKey], giteaEnv[giteaStorageSecretKey]
+	if bucket == "" || endpoint == "" || accessKey == "" || secretKey == "" {
+		return nil
+	}
+	return []string{
+		"GITEA__storage__STORAGE_TYPE=minio",
+		giteaStorageEndpoint + "=" + endpoint,
+		giteaStorageBucket + "=" + bucket,
+		giteaStorageAccessKey + "=" + accessKey,
+		giteaStorageSecretKey + "=" + secretKey,
+		"GITEA__storage__MINIO_LOCATION=auto",
+		"GITEA__storage__MINIO_USE_SSL=true",
+		"GITEA__storage__MINIO_BUCKET_LOOKUP=path",
+		"GITEA__storage__MINIO_CHECKSUM_ALGORITHM=md5",
+	}
+}
+
+func GiteaSpec(ds cloudapi.DesiredState, db DBConn, stackRoot string, storageEnv []string) dockerx.RunSpec {
 	domain := "git." + ds.BaseDomain
 	env := []string{
 		"GITEA__database__DB_TYPE=postgres",
@@ -199,6 +231,7 @@ func GiteaSpec(ds cloudapi.DesiredState, db DBConn, stackRoot string) dockerx.Ru
 		"GITEA__security__INSTALL_LOCK=true",
 		"GITEA__service__DISABLE_REGISTRATION=true",
 	}
+	env = append(env, storageEnv...) // R2/S3 object-storage offload when configured in /agent/gitea, else on-disk
 	return dockerx.RunSpec{
 		Name:         SvcGitea,
 		Service:      SvcGitea,
