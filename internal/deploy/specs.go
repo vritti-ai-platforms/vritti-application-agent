@@ -230,6 +230,12 @@ func GiteaSpec(ds cloudapi.DesiredState, db DBConn, stackRoot string, storageEnv
 		"GITEA__server__START_SSH_SERVER=true",
 		"GITEA__security__INSTALL_LOCK=true",
 		"GITEA__service__DISABLE_REGISTRATION=true",
+		// Cleanup crons keep the on-disk footprint bounded. git_gc_repos is OFF by default — enabling it runs
+		// periodic `git gc` to compact repositories (the one thing that can't move to R2); archive/package
+		// cleanups default on but are pinned. Section dots are escaped `_0X2E_` per Gitea's environment-to-ini.
+		"GITEA__cron_0X2E_git_gc_repos__ENABLED=true",
+		"GITEA__cron_0X2E_archive_cleanup__ENABLED=true",
+		"GITEA__cron_0X2E_cleanup_packages__ENABLED=true",
 	}
 	env = append(env, storageEnv...) // R2/S3 object-storage offload when configured in /agent/gitea, else on-disk
 	return dockerx.RunSpec{
